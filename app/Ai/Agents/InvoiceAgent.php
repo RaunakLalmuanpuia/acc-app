@@ -142,8 +142,6 @@ class InvoiceAgent implements Agent, Conversational, HasTools
             new UpdateInvoice($this->user),
             new DeleteInvoice($this->user),
             new GenerateInvoicePdf($this->user),
-            new GetClients($this->user),
-            new GetInventory($this->user),
         ];
     }
 }
