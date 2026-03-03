@@ -8,21 +8,44 @@ use App\Ai\Agents\InventoryAgent;
 use App\Ai\Agents\InvoiceAgent;
 use App\Ai\Agents\NarrationAgent;
 use App\Models\User;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Laravel\Ai\Contracts\Agent;
-use Illuminate\Support\Facades\DB;
 
 /**
- * AgentDispatcherService
+ * AgentDispatcherService  (v2 — full IBM MAS alignment)
  *
- * Resolves an intent string to its specialist agent class, configures the
- * agent with the correct conversation context, and executes the prompt.
+ * Resolves an intent to its specialist agent, enriches the message with
+ * inter-agent context (blackboard), dispatches the prompt, records
+ * observability metrics, and writes conversation metadata atomically.
  *
- * Responsibilities:
- *  - Agent class registry (intent → FQCN)
- *  - Conversation ID scoping ({base_id}:{intent}) for multi-intent sessions
- *  - Sequential dispatch with per-agent error isolation
- *  - Structured logging for observability
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v1
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * BUG 1 FIXED — configureConversation now scopes conversation IDs per-intent
+ *   for multi-intent turns. Previously $multiIntent and $intent were received
+ *   but never used — all agents shared the same history (cross-contamination).
+ *
+ * BUG 2 FIXED — catch block now returns array{reply, conversation_id} instead
+ *   of a bare string. The old errorResponse() return type caused a fatal
+ *   TypeError in dispatchAll() when any agent failed.
+ *
+ * BUG 3 FIXED — meta update uses PHP-side JSON mutation instead of DB::raw
+ *   string interpolation. The old code was an SQL injection vector.
+ *
+ * BUG 4 FIXED — dispatchAll() strips the ":intent" scope suffix when capturing
+ *   the base conversation ID from a new session's first response. The old code
+ *   stored the scoped ID as the base, causing the second agent to continue
+ *   "{scopedId}:{intent2}" instead of "{baseId}:{intent2}".
+ *
+ * GAP 1 — AgentContextBlackboard injected into dispatchAll(). After each
+ *   agent, its reply is written to the blackboard. Before each subsequent
+ *   agent, buildMessage() prepends the prior context preamble. Agents treat
+ *   prior work as established fact and skip redundant tool calls.
+ *
+ * GAP 3 — ObservabilityService injected via constructor. Every agent call
+ *   records latency, token usage, estimated cost, and success/failure state.
  */
 class AgentDispatcherService
 {
@@ -39,29 +62,52 @@ class AgentDispatcherService
     ];
 
     /**
-     * Dispatch multiple intents sequentially and collect all responses.
+     * Maps intent to the model name used by its specialist.
+     * Used for accurate per-agent cost estimation in ObservabilityService.
+     * Keep in sync with each agent's #[Model(...)] attribute.
+     */
+    private const AGENT_MODELS = [
+        'invoice'   => 'gpt-4o',
+        'client'    => 'gpt-4o',
+        'inventory' => 'gpt-4o',
+        'narration' => 'gpt-4o',
+        'business'  => 'gpt-4o',
+    ];
+
+    public function __construct(
+        private readonly ObservabilityService $observability,
+    ) {}
+
+    /**
+     * Dispatch multiple intents sequentially, sharing an AgentContextBlackboard
+     * so each specialist can read the prior agent's output before prompting.
      *
-     * Sequential (not parallel) dispatch is intentional: multi-intent turns
-     * often have data dependencies (e.g. ClientAgent creates a client, then
-     * InvoiceAgent uses that client ID). Parallel dispatch would break this.
+     * Sequential dispatch is intentional: multi-intent turns often have data
+     * dependencies (ClientAgent creates the client → InvoiceAgent uses that ID).
+     * The blackboard eliminates redundant lookups across this dependency chain.
      *
      * @param  string[]    $intents
      * @param  User        $user
      * @param  string      $message
      * @param  string|null $conversationId
      * @param  array       $attachments
-     * @return array<string, string>
+     * @param  bool        $hitlConfirmed   True when this dispatch originates from a
+     *                                      HITL confirm() call — agents must skip their
+     *                                      own internal re-confirmation prompts.
+     * @return array<string, array{reply: string, conversation_id: ?string}>
      */
     public function dispatchAll(
         array   $intents,
         User    $user,
         string  $message,
         ?string $conversationId,
-        array   $attachments = [],
+        array   $attachments    = [],
+        bool    $hitlConfirmed  = false,
     ): array {
-        $multiIntent = count($intents) > 1;
-        $results     = [];
+        $multiIntent        = count($intents) > 1;
+        $results            = [];
         $baseConversationId = $conversationId;
+        $blackboard         = new AgentContextBlackboard();
 
         foreach ($intents as $index => $intent) {
 
@@ -72,103 +118,168 @@ class AgentDispatcherService
                 conversationId: $baseConversationId,
                 multiIntent:    $multiIntent,
                 attachments:    $attachments,
+                blackboard:     $blackboard,
+                hitlConfirmed:  $hitlConfirmed,
             );
 
             $results[$intent] = $result;
 
-            // If this was a new conversation, capture the first created ID
+            // GAP 1: write this agent's reply to the blackboard so the next
+            // specialist can reference it without a redundant tool call.
+            $blackboard->record($intent, $result['reply']);
+
+            // BUG 4 FIX: strip the ":intent" scope suffix before storing
+            // the base conversation ID. In the old code, when conversationId
+            // was null (new session), the first response held a scoped ID
+            // (e.g. "uuid-here:invoice"). Storing that as the base caused the
+            // second agent to receive "uuid-here:invoice:client" — wrong.
             if ($index === 0 && $baseConversationId === null) {
-                $baseConversationId = $result['conversation_id'];
+                $rawId = $result['conversation_id'] ?? null;
+
+                $baseConversationId = ($multiIntent && $rawId !== null)
+                    ? explode(':', $rawId)[0]
+                    : $rawId;
             }
         }
 
         return $results;
-
     }
 
     /**
      * Dispatch a single intent to its specialist agent.
      *
-     * Conversation scoping:
-     *  - Single-intent: uses the raw conversationId as-is.
-     *  - Multi-intent : scopes the ID as "{conversationId}:{intent}" so each
-     *    specialist maintains independent memory within the same session.
-     *    The frontend always sees only the base ID — scoping is internal.
-     *
-     * @param  string      $intent
-     * @param  User        $user
-     * @param  string      $message
-     * @param  string|null $conversationId  Base conversation ID from the session.
-     * @param  bool        $multiIntent     Whether multiple intents are being dispatched.
-     * @param  array       $attachments     Optional file attachments (Image|Document).
-     * @return array{reply:string, conversation_id:?string}
+     * @param  string                      $intent
+     * @param  User                        $user
+     * @param  string                      $message
+     * @param  string|null                 $conversationId  Base (unscoped) ID
+     * @param  bool                        $multiIntent
+     * @param  array                       $attachments
+     * @param  AgentContextBlackboard|null $blackboard      Shared context from prior agents
+     * @param  bool                        $hitlConfirmed   Skip agent's own re-confirmation
+     * @return array{reply: string, conversation_id: ?string}
      */
     public function dispatch(
-        string  $intent,
-        User    $user,
-        string  $message,
-        ?string $conversationId,
-        bool    $multiIntent = false,
-        array   $attachments = [],
+        string                  $intent,
+        User                    $user,
+        string                  $message,
+        ?string                 $conversationId,
+        bool                    $multiIntent     = false,
+        array                   $attachments     = [],
+        ?AgentContextBlackboard $blackboard      = null,
+        bool                    $hitlConfirmed   = false,
     ): array {
+        $start = microtime(true);
+        $model = self::AGENT_MODELS[$intent] ?? 'gpt-4o';
+
         try {
             $agent = $this->resolveAgent($intent, $user);
-            $agent = $this->configureConversation($agent, $user, $conversationId, $intent, $multiIntent);
+
+            // BUG 1 FIX: conversation ID is now properly scoped per-intent
+            $agent = $this->configureConversation(
+                agent:          $agent,
+                user:           $user,
+                conversationId: $conversationId,
+                intent:         $intent,
+                multiIntent:    $multiIntent,
+            );
 
             Log::info('[AgentDispatcherService] Dispatching', [
                 'intent'          => $intent,
                 'user_id'         => $user->id,
                 'conversation_id' => $conversationId,
                 'multi_intent'    => $multiIntent,
+                'blackboard_has'  => $blackboard?->all() ? array_keys($blackboard->all()) : [],
             ]);
 
-            $intentScopedMessage = $this->scopeMessageForIntent($intent, $message);
+            // GAP 1: build message with blackboard context preamble injected
+            $prompt = $this->buildMessage(
+                intent:        $intent,
+                message:       $message,
+                blackboard:    $blackboard,
+                multiIntent:   $multiIntent,
+                hitlConfirmed: $hitlConfirmed,
+            );
 
             $response = $agent->prompt(
-                prompt: $intentScopedMessage,
+                prompt:      $prompt,
                 attachments: $attachments,
             );
 
-            // 2️⃣ Atomic meta update
-            DB::transaction(function () use ($response, $intent, $multiIntent) {
+            $latencyMs = (int) ((microtime(true) - $start) * 1000);
 
-                $messageRow = DB::table('agent_conversation_messages')
-                    ->where('conversation_id', $response->conversationId)
-                    ->where('role', 'assistant')
-                    ->orderByDesc('created_at')
-                    ->lockForUpdate()
-                    ->first();
+            // GAP 3: record per-agent observability metrics.
+            //
+            // WHY DB READ — NOT $response->usage:
+            //   The Laravel AI SDK writes the `usage` JSON to the
+            //   agent_conversation_messages row DURING or AFTER prompt() returns.
+            //   By the time execution reaches this line, $response->usage is null
+            //   on the response object — the data hasn't been set on it yet.
+            //   The DB row, however, was committed synchronously by the SDK's
+            //   persistence layer before prompt() returned control.
+            //   Reading the most recent assistant row is safe: prompt() is
+            //   synchronous and sequential, so there is no race condition.
+            $scopedConversationId = $response->conversationId;
+            $usageRow = DB::table('agent_conversation_messages')
+                ->where('conversation_id', $scopedConversationId)
+                ->where('role', 'assistant')
+                ->where('agent', get_class($agent))
+                ->orderByDesc('created_at')
+                ->value('usage');
 
-                if ($messageRow) {
-                    DB::table('agent_conversation_messages')
-                        ->where('id', $messageRow->id)
-                        ->update([
-                            'meta' => DB::raw("
-                            JSON_SET(
-                                COALESCE(meta, JSON_OBJECT()),
-                                '$.intent', '{$intent}',
-                                '$.multi_intent', " . ($multiIntent ? 'true' : 'false') . "
-                            )
-                        ")
-                        ]);
-                }
-            });
+            $usageData    = ($usageRow && $usageRow !== '[]') ? json_decode($usageRow, true) : [];
+            $inputTokens  = $usageData['prompt_tokens']     ?? null;
+            $outputTokens = $usageData['completion_tokens'] ?? null;
 
+            $this->observability->recordAgentCall(
+                intent:         $intent,
+                userId:         (string) $user->id,
+                conversationId: $conversationId,
+                model:          $model,
+                latencyMs:      $latencyMs,
+                inputTokens:    $inputTokens,
+                outputTokens:   $outputTokens,
+                success:        true,
+            );
 
+            // BUG 3 FIX: PHP-side JSON mutation — no DB::raw string interpolation
+            $this->writeMetaToMessage(
+                conversationId: $response->conversationId,
+                intent:         $intent,
+                multiIntent:    $multiIntent,
+            );
 
             return [
-                'reply' => (string) $response,
+                'reply'           => (string) $response,
                 'conversation_id' => $response->conversationId,
             ];
 
         } catch (\Throwable $e) {
+            $latencyMs = (int) ((microtime(true) - $start) * 1000);
+
+            // GAP 3: record failure metrics
+            $this->observability->recordAgentCall(
+                intent:         $intent,
+                userId:         (string) $user->id,
+                conversationId: $conversationId,
+                model:          $model,
+                latencyMs:      $latencyMs,
+                success:        false,
+                errorMessage:   $e->getMessage(),
+            );
+
             Log::error("[AgentDispatcherService] {$intent} agent failed", [
                 'user_id' => $user->id,
                 'error'   => $e->getMessage(),
                 'trace'   => $e->getTraceAsString(),
             ]);
 
-            return $this->errorResponse($intent);
+            // BUG 2 FIX: return array, not bare string.
+            // The old errorResponse() returned a string; dispatchAll() expected
+            // array{reply, conversation_id} and crashed with TypeError.
+            return [
+                'reply'           => $this->errorResponse($intent),
+                'conversation_id' => $conversationId,
+            ];
         }
     }
 
@@ -193,13 +304,16 @@ class AgentDispatcherService
     }
 
     /**
-     * Configure the agent with the appropriate conversation context.
+     * Configure the agent's conversation context.
      *
-     * Scoping strategy:
-     *  - Single intent : conversationId used directly — clean and simple.
-     *  - Multi-intent  : each specialist gets a scoped ID ({base}:{intent})
-     *    so individual histories do not bleed into each other.
-     *    The frontend never sees scoped IDs — only the base ID is returned.
+     * BUG 1 FIX — scoping strategy:
+     *   - Single-intent : use conversationId directly (unchanged behaviour).
+     *   - Multi-intent  : scope as "{conversationId}:{intent}" so each specialist
+     *     maintains independent memory. The frontend never sees scoped IDs.
+     *
+     * Previously this method received $intent and $multiIntent but never used them,
+     * causing all agents in a multi-intent turn to share the same conversation
+     * history — a silent cross-contamination bug.
      */
     private function configureConversation(
         Agent   $agent,
@@ -209,15 +323,129 @@ class AgentDispatcherService
         bool    $multiIntent,
     ): Agent {
         if ($conversationId === null) {
-            return $agent->forUser($user); // SDK assigns a fresh conversation ID
+            // New session — SDK assigns a fresh conversation ID
+            return $agent->forUser($user);
         }
 
-        return $agent->continue($conversationId, as: $user);
+        $scopedId = $multiIntent
+            ? "{$conversationId}:{$intent}"
+            : $conversationId;
+
+        return $agent->continue($scopedId, as: $user);
     }
 
     /**
-     * Return a domain-specific error message so the user understands
-     * which part of their request failed, without exposing internals.
+     * Build the final prompt string to send to the specialist.
+     *
+     * Injects up to three layers (when applicable):
+     *   1. HITL pre-authorization block — tells the agent this action was
+     *      already confirmed by the human via the HITL checkpoint. The agent
+     *      must NOT ask for confirmation again; it must execute immediately.
+     *   2. Blackboard context preamble — prior agents' completed work so this
+     *      specialist can avoid redundant tool calls (GAP 1).
+     *   3. Intent-scoping block — ensures the specialist ignores other domains
+     *      in a multi-intent message.
+     */
+    private function buildMessage(
+        string                  $intent,
+        string                  $message,
+        ?AgentContextBlackboard $blackboard,
+        bool                    $multiIntent,
+        bool                    $hitlConfirmed  = false,
+    ): string {
+        // ── Layer 1: HITL pre-authorization ───────────────────────────────
+        // Injected FIRST so it overrides any "confirm before acting" rule in
+        // the agent's own instructions. Without this, agents with deletion
+        // confirmation rules (ClientAgent, InvoiceAgent, etc.) will ask the
+        // user to confirm again even though HITL already handled it.
+        $hitlBlock = '';
+        if ($hitlConfirmed) {
+            $hitlBlock = <<<HITL
+            ╔══════════════════════════════════════════════════════════════════╗
+            ║  ✅ HITL PRE-AUTHORIZED — PROCEED WITHOUT RE-CONFIRMING          ║
+            ╠══════════════════════════════════════════════════════════════════╣
+            ║  This action was reviewed and explicitly confirmed by the human  ║
+            ║  user via the Human-in-the-Loop checkpoint.                      ║
+            ║                                                                  ║
+            ║  RULE: Execute the operation WITHOUT asking the user to confirm. ║
+            ║  You MAY call read-only tools (search, get details) to locate    ║
+            ║  the correct record before acting — this is encouraged.          ║
+            ║  Do NOT pause at any point to ask "are you sure?".               ║
+            ║  Do NOT warn about irreversibility — the user already agreed.    ║
+            ╚══════════════════════════════════════════════════════════════════╝
+
+            HITL;
+        }
+
+        // ── Layer 2: Blackboard context ───────────────────────────────────
+        $preamble = ($blackboard !== null && !$blackboard->isEmpty())
+            ? $blackboard->buildContextPreamble($intent)
+            : '';
+
+        if (!$multiIntent) {
+            return $hitlBlock . $preamble . $message;
+        }
+
+        // ── Layer 3: Intent-scoping (multi-intent only) ───────────────────
+        return <<<PROMPT
+        {$hitlBlock}{$preamble}The user message may contain requests for multiple domains.
+
+        You are ONLY responsible for the "{$intent}" domain.
+
+        Ignore all parts of the message unrelated to "{$intent}".
+        Do not mention other domains in your response.
+
+        If prior agent context is provided above, treat it as established fact:
+        - Do NOT re-fetch data that is already confirmed in the context.
+        - Do NOT re-create resources that were already created.
+        - Reference prior context to avoid redundant tool calls.
+
+        User message:
+        {$message}
+        PROMPT;
+    }
+
+    /**
+     * Atomically update the meta column on the latest assistant message.
+     *
+     * BUG 3 FIX — PHP-side JSON mutation replaces the old DB::raw string
+     * interpolation, which was an SQL injection vector via the $intent variable.
+     */
+    private function writeMetaToMessage(
+        ?string $conversationId,
+        string  $intent,
+        bool    $multiIntent,
+    ): void {
+        if ($conversationId === null) {
+            return;
+        }
+
+        DB::transaction(function () use ($conversationId, $intent, $multiIntent): void {
+            $messageRow = DB::table('agent_conversation_messages')
+                ->where('conversation_id', $conversationId)
+                ->where('role', 'assistant')
+                ->orderByDesc('created_at')
+                ->lockForUpdate()
+                ->first();
+
+            if ($messageRow === null) {
+                return;
+            }
+
+            // Decode existing meta safely, merge, re-encode — no raw SQL
+            $meta                = json_decode($messageRow->meta ?? '{}', true) ?: [];
+            $meta['intent']      = $intent;
+            $meta['multi_intent'] = $multiIntent;
+
+            DB::table('agent_conversation_messages')
+                ->where('id', $messageRow->id)
+                ->update(['meta' => json_encode($meta)]);
+        });
+    }
+
+    /**
+     * Build a domain-specific error message for the user.
+     * Never exposes internal details or stack traces.
      */
     private function errorResponse(string $intent): string
     {
@@ -233,26 +461,5 @@ class AgentDispatcherService
 
         return "I encountered an issue with {$label}. Please try again in a moment. "
             . "If the problem persists, please contact support.";
-    }
-    /**
-     * Scope a multi-domain user message to a single specialist intent.
-     *
-     * Ensures that each specialist agent only processes the portion of the
-     * message relevant to its own domain and does not respond defensively
-     * about other domains.
-     */
-    private function scopeMessageForIntent(string $intent, string $message): string
-    {
-        return <<<PROMPT
-        The user message may contain requests for multiple domains.
-
-        You are ONLY responsible for the "{$intent}" domain.
-
-        Ignore all parts of the message unrelated to "{$intent}".
-        Do not mention other domains in your response.
-
-        User message:
-        {$message}
-        PROMPT;
     }
 }

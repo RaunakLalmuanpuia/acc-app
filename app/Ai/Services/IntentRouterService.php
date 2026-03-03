@@ -6,19 +6,46 @@ use App\Ai\Agents\RouterAgent;
 use Illuminate\Support\Facades\Log;
 
 /**
- * IntentRouterService
+ * IntentRouterService  (v2 — Gap 2 fixed)
  *
  * Encapsulates all logic for calling the RouterAgent, parsing its JSON output,
  * validating intents, and gracefully recovering from failure.
  *
- * Separation of concerns: the orchestrator delegates ALL routing concerns here.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * GAP 2 FIX — RouterAgent failure fallback
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * BEFORE (v1):
+ *   On RouterAgent failure, return json_encode(['intents' => VALID_DOMAIN_INTENTS])
+ *   → Dispatches ALL 5 specialist agents (5x gpt-4o calls for a routing failure).
+ *   → Expensive and produces a multi-section reply that confuses the user.
+ *
+ * AFTER (v2):
+ *   On RouterAgent failure, return json_encode(['intents' => ['unknown']])
+ *   → 'unknown' is filtered out by filterValid(), resolve() returns []
+ *   → ChatOrchestrator's DB fallback (getLastIntent) tries to recover from
+ *     conversation history instead.
+ *   → If DB fallback also finds nothing, the static unknownResponse() is
+ *     returned — zero AI cost, no confusing multi-domain noise.
+ *
+ * This is the correct failure mode: a routing failure should be cheap and quiet,
+ * not loud and expensive.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SAME PARSE FALLBACK LOGIC — also fixed
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * BEFORE: parseIntents() returned VALID_DOMAIN_INTENTS on JSON parse failure,
+ *   again triggering all 5 agents unnecessarily.
+ *
+ * AFTER: parseIntents() returns [] on JSON parse failure, letting the DB
+ *   fallback or unknownResponse() handle it.
  */
 class IntentRouterService
 {
     /**
      * Domain intents that map to specialist agents.
-     * Any intent NOT in this list (including 'unknown') is filtered out
-     * before agent dispatch.
+     * Any intent NOT in this list (including 'unknown') is filtered out.
      */
     public const VALID_DOMAIN_INTENTS = [
         'invoice',
@@ -34,7 +61,8 @@ class IntentRouterService
      * Route a user message to one or more domain intents.
      *
      * Returns an array of valid domain intents only.
-     * Returns an empty array if the message is unknown / greeting / off-topic.
+     * Returns an empty array if the message is unknown / greeting / off-topic,
+     * or if the router fails — the orchestrator handles both cases the same way.
      *
      * @param  string   $message  The raw user message.
      * @return string[]           e.g. ['invoice'], ['client', 'invoice'], []
@@ -51,7 +79,13 @@ class IntentRouterService
 
     /**
      * Prompt the RouterAgent and return the raw response string.
-     * On failure, returns a safe fallback JSON string that routes to all domains.
+     *
+     * GAP 2 FIX: On failure, return ['unknown'] instead of all domain intents.
+     * This lets the orchestrator's DB fallback (getLastIntent) take over, or
+     * fall through to the zero-cost unknownResponse() static reply.
+     *
+     * The old "route to all domains" fallback was expensive (5x gpt-4o calls)
+     * and produced a confusing multi-domain response for what was a routing error.
      */
     private function callRouter(string $message): string
     {
@@ -60,13 +94,14 @@ class IntentRouterService
             return trim((string) $response);
         } catch (\Throwable $e) {
             Log::error('[IntentRouterService] RouterAgent call failed', [
-                'message' => $message,
-                'error'   => $e->getMessage(),
-                'trace'   => $e->getTraceAsString(),
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
 
-            // Safe fallback: route to all domain agents (slightly expensive but never wrong)
-            return json_encode(['intents' => self::VALID_DOMAIN_INTENTS]);
+            // Return 'unknown' — the orchestrator's DB fallback will attempt
+            // to recover from conversation history. If that also fails, the
+            // static unknownResponse() is returned at zero AI cost.
+            return json_encode(['intents' => ['unknown']]);
         }
     }
 
@@ -77,6 +112,9 @@ class IntentRouterService
      *  - Model wraps output in markdown code fences (``` ... ```)
      *  - Model returns invalid JSON
      *  - 'intents' key is missing or not an array
+     *
+     * GAP 2 FIX: On parse failure, return [] instead of VALID_DOMAIN_INTENTS.
+     * Prevents unnecessary 5-agent dispatch on a parse error.
      */
     private function parseIntents(string $raw): array
     {
@@ -93,7 +131,7 @@ class IntentRouterService
                 'error' => $e->getMessage(),
             ]);
 
-            return self::VALID_DOMAIN_INTENTS; // fallback: route to all
+            return []; // GAP 2 FIX: was VALID_DOMAIN_INTENTS — too expensive on failure
         }
 
         if (!isset($decoded['intents']) || !is_array($decoded['intents'])) {
@@ -101,7 +139,7 @@ class IntentRouterService
                 'decoded' => $decoded,
             ]);
 
-            return self::VALID_DOMAIN_INTENTS; // fallback: route to all
+            return []; // GAP 2 FIX: was VALID_DOMAIN_INTENTS
         }
 
         return $decoded['intents'];

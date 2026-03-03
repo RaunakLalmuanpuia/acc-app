@@ -3,35 +3,53 @@
 namespace App\Ai;
 
 use App\Ai\Services\AgentDispatcherService;
+use App\Ai\Services\HitlService;
 use App\Ai\Services\IntentRouterService;
+use App\Ai\Services\ObservabilityService;
 use App\Ai\Services\ResponseMergerService;
 use App\Models\User;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
 /**
- * ChatOrchestrator
+ * ChatOrchestrator  (v2 — full IBM MAS alignment)
  *
  * The coordination layer for the multi-agent accounting chat system.
+ * This class performs NO AI reasoning — it is a pure PHP coordinator.
  *
- * This class is NOT an AI agent — it performs no AI reasoning itself.
- * It is a plain PHP coordinator that wires the three services together.
- * All dependencies are resolved automatically by Laravel's container
- * via constructor type-hints — no service provider required.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * UPDATED FLOW (v2)
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flow:
- *   1. Receive (user, message, conversationId, attachments) from the controller.
- *   2. IntentRouterService  → resolve valid domain intent(s) via RouterAgent.
- *   3. If no valid intents  → return static unknown response (zero AI cost).
- *   4. AgentDispatcherService → dispatch to specialist agent(s) sequentially.
- *   5. ResponseMergerService  → merge replies into one coherent string.
- *   6. Return (reply, conversationId) to the controller.
+ *  1. Receive (user, message, conversationId, attachments) from the controller.
+ *  2. IntentRouterService  → resolve domain intent(s) via RouterAgent.
+ *  3. DB fallback          → reuse last intent from conversation history if empty.
+ *  4. Unknown gate         → return static reply at zero AI cost if still empty.
+ *  5. HITL checkpoint      → intercept destructive operations BEFORE dispatch.
+ *     a. Store action in cache, return warning + pending_id to frontend.
+ *     b. Frontend shows "Confirm / Cancel". User confirms → confirm() endpoint.
+ *  6. AgentDispatcherService → dispatch to specialist(s) sequentially with
+ *     AgentContextBlackboard for inter-agent communication (Gap 1).
+ *  7. ObservabilityService → record turn-level metrics (Gap 3).
+ *  8. ResponseMergerService  → merge replies into one coherent string.
+ *  9. Return {reply, conversation_id, hitl_pending} to the controller.
  *
- * Conversation ID contract with the frontend:
- *   - Frontend always sends ONE base conversationId (or null for new sessions).
- *   - Scoping for multi-intent sessions is handled internally by AgentDispatcherService.
- *   - Frontend always receives the same base conversationId back.
- *   - The frontend requires zero changes from the monolith design.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * RETURN CONTRACT WITH FRONTEND (expanded in v2)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *  Normal response:
+ *    { reply: string, conversation_id: string|null, hitl_pending: false }
+ *
+ *  HITL checkpoint triggered:
+ *    { reply: string (warning), conversation_id: string|null,
+ *      hitl_pending: true, pending_id: string (UUID) }
+ *
+ *  Frontend must:
+ *    - When hitl_pending = true: show the warning + "Confirm" / "Cancel" buttons.
+ *    - On "Confirm": POST /ai/chat/confirm with { pending_id }.
+ *    - On "Cancel": discard and let the user amend their message.
+ *    - The base conversation_id is unchanged in both flows.
  */
 class ChatOrchestrator
 {
@@ -39,16 +57,23 @@ class ChatOrchestrator
         private readonly IntentRouterService    $router,
         private readonly AgentDispatcherService $dispatcher,
         private readonly ResponseMergerService  $merger,
+        private readonly HitlService            $hitl,
+        private readonly ObservabilityService   $observability,
     ) {}
 
     /**
      * Handle a single chat turn end-to-end.
      *
-     * @param  User        $user              Authenticated user.
-     * @param  string      $message           The user's raw message.
-     * @param  string|null $conversationId    Existing session ID, or null for new.
-     * @param  array       $attachments       Optional AI SDK attachment objects.
-     * @return array{reply: string, conversation_id: string|null}
+     * @param  User        $user
+     * @param  string      $message
+     * @param  string|null $conversationId  Existing session ID, or null for new.
+     * @param  array       $attachments     Optional AI SDK attachment objects.
+     * @return array{
+     *   reply: string,
+     *   conversation_id: string|null,
+     *   hitl_pending: bool,
+     *   pending_id?: string
+     * }
      */
     public function handle(
         User    $user,
@@ -56,6 +81,8 @@ class ChatOrchestrator
         ?string $conversationId,
         array   $attachments = [],
     ): array {
+        $turnStart = microtime(true);
+
         Log::info('[ChatOrchestrator] Handling message', [
             'user_id'         => $user->id,
             'conversation_id' => $conversationId,
@@ -67,16 +94,14 @@ class ChatOrchestrator
 
         Log::info('[ChatOrchestrator] Resolved intents', ['intents' => $intents]);
 
-        // ───────────────────────────────────────────────────────────
-        // 2️⃣ Reuse Previous Intents if Router Returned Empty
-        // ───────────────────────────────────────────────────────────
-
-        if (empty($intents) && $conversationId) {
-
+        // ── Step 2: DB fallback — reuse last intent from conversation history ──
+        // Triggered when the router returns [] AND a prior conversation exists.
+        // Handles follow-up messages like "make it ₹5000 instead" where the
+        // router cannot classify without domain context.
+        if (empty($intents) && $conversationId !== null) {
             $lastIntent = $this->getLastIntent($conversationId);
 
-            if ($lastIntent) {
-
+            if ($lastIntent !== null) {
                 Log::info('[ChatOrchestrator] Reusing previous intent from DB', [
                     'conversation_id' => $conversationId,
                     'intent'          => $lastIntent,
@@ -86,43 +111,185 @@ class ChatOrchestrator
             }
         }
 
-        // ── Step 2: Handle unknown / no valid domain intents ───────────────────
-        // No AI agents are invoked — zero gpt-4o cost for greetings / off-topic.
+        // ── Step 3: Unknown gate — zero AI cost for off-topic messages ─────────
         if (empty($intents)) {
             return [
                 'reply'           => $this->merger->unknownResponse(),
                 'conversation_id' => $conversationId,
+                'hitl_pending'    => false,
             ];
         }
 
-        // ── Step 3: Dispatch to specialist agent(s) sequentially ───────────────
+        // ── Step 4: HITL checkpoint — intercept destructive operations ─────────
+        //
+        // IBM governance pattern: a hard checkpoint before any irreversible action.
+        // The specialist agent is NOT dispatched until the user explicitly confirms.
+        //
+        // Flow:
+        //   a) requiresCheckpoint() detects destructive keywords for guarded intents.
+        //   b) storePendingAction() persists the full turn context in cache (TTL 15m).
+        //   c) A warning + pending_id is returned to the frontend instead of a reply.
+        //   d) Frontend shows "Confirm / Cancel". Confirm → POST /ai/chat/confirm.
+        //   e) confirm() below retrieves, validates, and re-dispatches the action.
+        if ($this->hitl->requiresCheckpoint($message, $intents)) {
+            $pendingId = $this->hitl->storePendingAction(
+                userId:         (string) $user->id,
+                message:        $message,
+                intents:        $intents,
+                conversationId: $conversationId,
+            );
+
+            Log::info('[ChatOrchestrator] HITL checkpoint triggered', [
+                'user_id'    => $user->id,
+                'intents'    => $intents,
+                'pending_id' => $pendingId,
+            ]);
+
+            return [
+                'reply'           => $this->hitl->buildCheckpointMessage($message, $intents),
+                'conversation_id' => $conversationId,
+                'hitl_pending'    => true,
+                'pending_id'      => $pendingId,
+            ];
+        }
+
+        // ── Step 5 & 6: Dispatch + merge ──────────────────────────────────────
+        return $this->executeDispatch(
+            user:           $user,
+            message:        $message,
+            conversationId: $conversationId,
+            intents:        $intents,
+            attachments:    $attachments,
+            turnStart:      $turnStart,
+        );
+    }
+
+    /**
+     * Resume a HITL-gated action after the user explicitly confirms.
+     *
+     * Called by AiChatController::confirm() when the user clicks "Confirm".
+     * Retrieves the pending action from cache, validates ownership,
+     * and re-dispatches without re-triggering the HITL check.
+     *
+     * @param  User   $user
+     * @param  string $pendingId  UUID returned in the HITL checkpoint response
+     * @param  array  $attachments  Re-attached files (original attachments cannot be cached)
+     * @return array{reply: string, conversation_id: ?string, hitl_pending: false}
+     */
+    public function confirm(
+        User   $user,
+        string $pendingId,
+        array  $attachments = [],
+    ): array {
+        $turnStart = microtime(true);
+
+        // consumePendingAction() retrieves and immediately deletes — one-time use
+        $action = $this->hitl->consumePendingAction($pendingId);
+
+        if ($action === null) {
+            Log::warning('[ChatOrchestrator] HITL action not found or expired', [
+                'user_id'    => $user->id,
+                'pending_id' => $pendingId,
+            ]);
+
+            return [
+                'reply'           => "This confirmation has expired (15-minute limit). "
+                    . "Please re-send your original request.",
+                'conversation_id' => null,
+                'hitl_pending'    => false,
+            ];
+        }
+
+        // Security: confirm the requesting user owns the pending action
+        if ((string) $user->id !== (string) $action['user_id']) {
+            Log::warning('[ChatOrchestrator] HITL ownership mismatch', [
+                'requesting_user' => $user->id,
+                'action_user'     => $action['user_id'],
+                'pending_id'      => $pendingId,
+            ]);
+
+            return [
+                'reply'           => "You are not authorized to confirm this action.",
+                'conversation_id' => null,
+                'hitl_pending'    => false,
+            ];
+        }
+
+        Log::info('[ChatOrchestrator] HITL confirmed — re-dispatching', [
+            'user_id'    => $user->id,
+            'pending_id' => $pendingId,
+            'intents'    => $action['intents'],
+        ]);
+
+        // Re-dispatch directly — HITL is NOT re-triggered for confirmed actions.
+        // hitlConfirmed: true injects the pre-authorization block into the agent's
+        // prompt so it skips its own internal "are you sure?" confirmation step.
+        return $this->executeDispatch(
+            user:           $user,
+            message:        $action['message'],
+            conversationId: $action['conversation_id'],
+            intents:        $action['intents'],
+            attachments:    $attachments,
+            turnStart:      $turnStart,
+            hitlConfirmed:  true,
+        );
+    }
+
+    // ── Private ────────────────────────────────────────────────────────────────
+
+    /**
+     * Execute the actual agent dispatch + merge + observability recording.
+     *
+     * Extracted to avoid duplication between handle() and confirm() — both
+     * end in the same dispatch → merge → observe sequence.
+     *
+     * @param  bool $hitlConfirmed  When true, injects the HITL pre-authorization
+     *                              block into every agent's prompt so they skip
+     *                              their own internal re-confirmation prompts.
+     */
+    private function executeDispatch(
+        User    $user,
+        string  $message,
+        ?string $conversationId,
+        array   $intents,
+        array   $attachments,
+        float   $turnStart,
+        bool    $hitlConfirmed  = false,
+    ): array {
         $responses = $this->dispatcher->dispatchAll(
             intents:        $intents,
             user:           $user,
             message:        $message,
             conversationId: $conversationId,
             attachments:    $attachments,
+            hitlConfirmed:  $hitlConfirmed,
         );
 
-        // First response holds base conversation ID
-        $first = reset($responses);
+        $first             = reset($responses);
+        $newConversationId = $conversationId ?? ($first['conversation_id'] ?? null);
+        $replyStrings      = array_map(fn ($r) => $r['reply'], $responses);
+        $reply             = $this->merger->merge($replyStrings);
 
-        $newConversationId = $conversationId
-            ?? ($first['conversation_id'] ?? null);
-
-        // Extract only reply strings for merger
-        $replyStrings = array_map(fn ($r) => $r['reply'], $responses);
-
-        $reply = $this->merger->merge($replyStrings);
-
-
+        // GAP 3: record turn-level observability summary
+        $totalLatencyMs = (int) ((microtime(true) - $turnStart) * 1000);
+        $this->observability->recordTurnSummary(
+            userId:         (string) $user->id,
+            conversationId: $newConversationId,
+            intents:        $intents,
+            totalLatencyMs: $totalLatencyMs,
+        );
 
         return [
-            'reply' => $reply,
+            'reply'           => $reply,
             'conversation_id' => $newConversationId,
+            'hitl_pending'    => false,
         ];
     }
 
+    /**
+     * Retrieve the last used intent from conversation message metadata.
+     * Used as the DB fallback when the RouterAgent returns no valid intents.
+     */
     private function getLastIntent(string $conversationId): ?string
     {
         return DB::table('agent_conversation_messages')

@@ -36,6 +36,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::post('/accounting/chat', [AiChatController::class, 'send'])
         ->name('accounting.chat.send');
 
+    Route::post('/accounting/chat/confirm', [AiChatController::class, 'confirm'])->name('accounting.chat.confirm');
 });
 
 require __DIR__.'/auth.php';

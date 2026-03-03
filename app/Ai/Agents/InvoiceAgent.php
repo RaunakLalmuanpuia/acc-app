@@ -3,6 +3,7 @@
 namespace App\Ai\Agents;
 
 use App\Ai\Tools\Client\GetClients;
+use App\Ai\Tools\Inventory\GetInventory;
 use App\Ai\Tools\Invoice\ConfirmInvoice;
 use App\Ai\Tools\Invoice\CreateInvoiceDraft;
 use App\Ai\Tools\Invoice\DeleteInvoice;
@@ -141,8 +142,8 @@ class InvoiceAgent implements Agent, Conversational, HasTools
             new UpdateInvoice($this->user),
             new DeleteInvoice($this->user),
             new GenerateInvoicePdf($this->user),
-            // Client lookup — needed to resolve client name → ID during invoice creation
             new GetClients($this->user),
+            new GetInventory($this->user),
         ];
     }
 }
