@@ -4,7 +4,7 @@ import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import {
     Send, Sparkles, Paperclip, X, AlertCircle, Loader2, Copy, Check,
     FileText, Users, Package, Building, Download, AlertTriangle,
-    CheckCircle2, XCircle
+    CheckCircle2, XCircle,ArrowLeftRight
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -296,6 +296,7 @@ export default function Chat() {
         { icon: <Users    size={18} />, title: 'Client Management',    desc: 'Look up client details, create new clients, update clients and delete clients.' },
         { icon: <Package  size={18} />, title: 'Inventory Management', desc: 'Look up inventory items, add new products, update stock levels, and delete items.' },
         { icon: <FileText size={18} />, title: 'Invoice Management',   desc: 'Draft new invoices, preview PDFs, fetch existing records, and manage your billing.' },
+        { icon: <ArrowLeftRight  size={18} />, title: 'Bank Transactions',     desc: 'Review, narrate, and reconcile bank transactions with invoice. Flag suspicious entries and match credits to invoices.' }
     ];
 
     return (
