@@ -2,23 +2,21 @@
 
 namespace App\Ai\Tools\BankTransaction;
 
-use App\Models\BankTransaction;
 use App\Models\User;
+use App\Services\BankTransactionService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-/**
- * GetBankTransactions — read-only lookup tool.
- *
- * Returns a filtered list of bank transactions for the authenticated user.
- * Used by BankTransactionAgent as its primary discovery tool (ReWOO plan-first:
- * always look up before asking the user for details).
- */
 class GetBankTransactions implements Tool
 {
-    public function __construct(private readonly User $user) {}
+    private BankTransactionService $service;
+
+    public function __construct(User $user)
+    {
+        $this->service = new BankTransactionService($user);
+    }
 
     public function description(): Stringable|string
     {
@@ -31,52 +29,17 @@ class GetBankTransactions implements Tool
 
     public function handle(Request $request): Stringable|string
     {
-        $query = BankTransaction::query()
-            ->whereHas('bankAccount', fn ($q) => $q->where('user_id', $this->user->id))
-            ->with(['narrationHead', 'narrationSubHead', 'bankAccount'])
-            ->orderByDesc('transaction_date')
-            ->limit(min((int) ($request['limit'] ?? 20), 50));
+        $result = $this->service->getTransactions(
+            fromDate:      $request['from_date'] ?? null,
+            toDate:        $request['to_date'] ?? null,
+            type:          $request['type'] ?? null,
+            reviewStatus:  $request['review_status'] ?? null,
+            isReconciled:  isset($request['is_reconciled']) ? (bool) $request['is_reconciled'] : null,
+            bankAccountId: isset($request['bank_account_id']) ? (int) $request['bank_account_id'] : null,
+            limit:         (int) ($request['limit'] ?? 20),
+        );
 
-        if ($request['from_date'])            $query->whereDate('transaction_date', '>=', $request['from_date']);
-        if ($request['to_date'])              $query->whereDate('transaction_date', '<=', $request['to_date']);
-        if ($request['type'])                 $query->where('type', $request['type']);
-        if ($request['review_status'])        $query->where('review_status', $request['review_status']);
-        if (isset($request['is_reconciled'])) $query->where('is_reconciled', (bool) $request['is_reconciled']);
-        if ($request['bank_account_id'])      $query->where('bank_account_id', (int) $request['bank_account_id']);
-
-        $transactions = $query->get();
-
-        if ($transactions->isEmpty()) {
-            return json_encode([
-                'found'        => false,
-                'transactions' => [],
-                'message'      => 'No transactions matched the filters.',
-            ]);
-        }
-
-        return json_encode([
-            'found'        => true,
-            'count'        => $transactions->count(),
-            'transactions' => $transactions->map(fn ($t) => [
-                'id'                 => $t->id,
-                'transaction_date'   => $t->transaction_date->toDateString(),
-                'bank_reference'     => $t->bank_reference,
-                'raw_narration'      => $t->raw_narration,
-                'type'               => $t->type,
-                'amount'             => number_format($t->amount, 2),
-                'balance_after'      => number_format($t->balance_after, 2),
-                'narration_head'     => $t->narrationHead?->name,
-                'narration_sub_head' => $t->narrationSubHead?->name,
-                'narration_note'     => $t->narration_note,
-                'party_name'         => $t->party_name,
-                'party_reference'    => $t->party_reference,
-                'narration_source'   => $t->narration_source,
-                'review_status'      => $t->review_status,
-                'is_reconciled'      => $t->is_reconciled,
-                'is_duplicate'       => $t->is_duplicate,
-                'bank_account'       => $t->bankAccount?->name,
-            ])->toArray(),
-        ]);
+        return json_encode($result);
     }
 
     public function schema(JsonSchema $schema): array

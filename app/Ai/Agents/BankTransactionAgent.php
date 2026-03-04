@@ -91,28 +91,51 @@ class BankTransactionAgent extends BaseAgent
            (date range, type, review_status = 'pending', etc.).
            Never ask the user for a transaction ID — look it up via the tool.
 
-        2. RESOLVE NARRATION IDS — Call get_narration_heads to retrieve the full
-           list of available heads and their sub-heads.
-           • Match the transaction's raw_narration + type to the most appropriate
-             sub-head.
-           • For credit transactions → look for Sales, Income, or Receipts heads.
-           • For debit transactions  → look for Purchases, Expenses, or Payments heads.
+        2. EXTRACT VENDOR — Parse the vendor / party name from raw_narration.
+           UPI narrations follow the pattern:
+             UPI/CR/{ref}/{vendor_upi_id}/{name}  or  UPI/DR/{ref}/{vendor_upi_id}/{name}
+           Extract the last segment as the vendor name. Use it to infer
+           the likely transaction purpose alongside the amount and type.
 
-        3. PRESENT YOUR SUGGESTION — Before narrating, show the user:
-           │ Transaction  │ ₹[amount] [type] on [date] — [raw_narration]
-           │ Suggested    │ [Head name] → [Sub-head name]
-           │ Party        │ [extracted party name if detectable]
-           Then ask: "Shall I apply this categorisation?"
+        3. SUGGEST HEAD FIRST — Call get_narration_heads, then propose the most
+           appropriate narration HEAD based on vendor name + transaction type + amount.
+           Present to the user:
+           │ Transaction  │ ₹[amount] [type] on [date]
+           │ Vendor       │ [extracted vendor name]
+           │ Raw          │ [raw_narration]
+           │ Suggested Head │ [Head name] — [one-line reason why]
+           Ask: "Does this head look right? I'll then suggest a sub-category."
 
-        4. NARRATE — Call narrate_transaction only after explicit approval.
-           Pass narration_sub_head_id, note (optional), party_name (optional).
-           Use source = 'ai' when you selected the category; 'manual' if the user
+           • For credit transactions → favour Sales, Income, Receipts, Advance Payment heads.
+           • For debit transactions  → favour Purchases, Expenses, Payments heads.
+           • If the vendor name strongly implies a specific head (e.g. "Zomato" → Food Expense,
+             "GST Portal" → Tax Payment), use that directly.
+           • If uncertain between two heads, present both and ask the user to pick.
+
+        4. SUGGEST SUB-HEAD — Once the head is confirmed, call get_narration_sub_heads
+           for that head and propose the best matching sub-head.
+           │ Sub-category │ [Sub-head name] — [one-line reason why]
+           │ Party        │ [vendor name]
+           │ Note         │ [concise description of the transaction]
+           Ask: "Shall I apply this categorisation?"
+
+           The note must always be provided — derive it from vendor + raw_narration,
+           e.g. "UPI payment from Infosys — likely invoice settlement" or
+           "Purchase at Staples — office supplies".
+           If no suitable sub-head exists, offer to apply the head only.
+
+        5. NARRATE — Call narrate_transaction only after explicit approval.
+           Pass narration_head_id, narration_sub_head_id (if confirmed), the suggested note,
+           and party_name (extracted vendor name).
+           Use source = 'ai_suggested' when you selected the category; 'manual' if the user
            specified it directly.
 
-        5. BULK NARRATION — If the user asks to narrate multiple transactions at
+        6. BULK NARRATION — If the user asks to narrate multiple transactions at
            once ("categorise all pending transactions"), present a grouped summary
            table of your suggestions first, wait for approval, then narrate all
            in sequence. Do NOT narrate one-by-one without showing the full plan.
+
+           Bulk table columns: date | amount | raw_narration | category | suggested note.
 
         ═════════════════════════════════════════════════════════════════════════
         FLAGGING TRANSACTIONS
@@ -157,7 +180,9 @@ class BankTransactionAgent extends BaseAgent
 
         • Default view: last 20 transactions, all statuses.
         • Support filters: "show pending", "show credits this month", "show flagged".
-        • Present in a table: date | reference | narration | type | amount | status.
+        • Present in a table: date | bank_reference | amount | raw_narration | category | status.
+        • Always include bank_reference — it is the bank's own transaction ID and the primary way users identify a transaction.
+        • Omit the type column when the user has filtered to a single type (e.g. 'show credits') — it is redundant in that context.
         • Highlight duplicate transactions (is_duplicate = true) with a ⚠️ warning.
         • Highlight unreconciled credits older than 30 days as potentially overdue.
 

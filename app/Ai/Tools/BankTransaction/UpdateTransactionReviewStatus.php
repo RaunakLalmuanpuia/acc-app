@@ -2,22 +2,21 @@
 
 namespace App\Ai\Tools\BankTransaction;
 
-use App\Models\BankTransaction;
 use App\Models\User;
+use App\Services\BankTransactionService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-/**
- * UpdateTransactionReviewStatus — set the review_status on a transaction.
- *
- * Use 'flagged' for suspicious or unresolvable transactions that need
- * human attention. Always include a note when flagging.
- */
 class UpdateTransactionReviewStatus implements Tool
 {
-    public function __construct(private readonly User $user) {}
+    private BankTransactionService $service;
+
+    public function __construct(User $user)
+    {
+        $this->service = new BankTransactionService($user);
+    }
 
     public function description(): Stringable|string
     {
@@ -28,40 +27,13 @@ class UpdateTransactionReviewStatus implements Tool
 
     public function handle(Request $request): Stringable|string
     {
-        $allowed = ['pending', 'reviewed', 'flagged'];
+        $result = $this->service->updateReviewStatus(
+            transactionId: (int) $request['transaction_id'],
+            reviewStatus:  $request['review_status'],
+            note:          $request['note'] ?? null,
+        );
 
-        if (!in_array($request['review_status'], $allowed, true)) {
-            return json_encode([
-                'success' => false,
-                'error'   => 'Invalid review_status. Must be one of: ' . implode(', ', $allowed),
-            ]);
-        }
-
-        $transaction = BankTransaction::query()
-            ->whereHas('bankAccount', fn ($q) => $q->where('user_id', $this->user->id))
-            ->find((int) $request['transaction_id']);
-
-        if (!$transaction) {
-            return json_encode([
-                'success' => false,
-                'error'   => 'Transaction not found or does not belong to this user.',
-            ]);
-        }
-
-        $updates = ['review_status' => $request['review_status']];
-
-        if ($request['note'] !== null) {
-            $updates['narration_note'] = $request['note'];
-        }
-
-        $transaction->update($updates);
-
-        return json_encode([
-            'success'        => true,
-            'transaction_id' => $transaction->id,
-            'review_status'  => $transaction->review_status,
-            'note'           => $transaction->narration_note,
-        ]);
+        return json_encode($result);
     }
 
     public function schema(JsonSchema $schema): array
