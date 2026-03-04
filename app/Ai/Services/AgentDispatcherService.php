@@ -2,98 +2,56 @@
 
 namespace App\Ai\Services;
 
-use App\Ai\Agents\BusinessProfileAgent;
-use App\Ai\Agents\ClientAgent;
-use App\Ai\Agents\InventoryAgent;
-use App\Ai\Agents\InvoiceAgent;
-use App\Ai\Agents\NarrationAgent;
+use App\Ai\Services\AgentContextBlackboard;
+use App\Ai\AgentRegistry;
+use App\Ai\Agents\BaseAgent;
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Laravel\Ai\Contracts\Agent;
 
 /**
- * AgentDispatcherService  (v2 — full IBM MAS alignment)
+ * AgentDispatcherService  (v3 — AgentRegistry-driven + outcome signals)
  *
  * Resolves an intent to its specialist agent, enriches the message with
  * inter-agent context (blackboard), dispatches the prompt, records
  * observability metrics, and writes conversation metadata atomically.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v1
+ * CHANGES FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * BUG 1 FIXED — configureConversation now scopes conversation IDs per-intent
- *   for multi-intent turns. Previously $multiIntent and $intent were received
- *   but never used — all agents shared the same history (cross-contamination).
+ * AGENT_MAP and AGENT_MODELS removed — both are now sourced from AgentRegistry.
+ *   Adding a new agent requires only one line in AgentRegistry::AGENTS.
+ *   No changes needed here.
  *
- * BUG 2 FIXED — catch block now returns array{reply, conversation_id} instead
- *   of a bare string. The old errorResponse() return type caused a fatal
- *   TypeError in dispatchAll() when any agent failed.
+ * OUTCOME SIGNAL added to recordAgentCall():
+ *   After prompt() returns, dispatcher checks whether the agent called any write
+ *   tools by comparing toolsUsed against BaseAgent::writeTools() for the intent.
+ *   This populates ObservabilityService's new $outcomeSignal parameter:
+ *     'completed'  → agent called at least one write tool, no trailing question
+ *     'clarifying' → agent returned a question without calling any write tool
+ *     'partial'    → agent called a write tool but also asked a question
+ *   Falls back to null if SDK does not expose toolsUsed.
  *
- * BUG 3 FIXED — meta update uses PHP-side JSON mutation instead of DB::raw
- *   string interpolation. The old code was an SQL injection vector.
- *
- * BUG 4 FIXED — dispatchAll() strips the ":intent" scope suffix when capturing
- *   the base conversation ID from a new session's first response. The old code
- *   stored the scoped ID as the base, causing the second agent to continue
- *   "{scopedId}:{intent2}" instead of "{baseId}:{intent2}".
- *
- * GAP 1 — AgentContextBlackboard injected into dispatchAll(). After each
- *   agent, its reply is written to the blackboard. Before each subsequent
- *   agent, buildMessage() prepends the prior context preamble. Agents treat
- *   prior work as established fact and skip redundant tool calls.
- *
- * GAP 3 — ObservabilityService injected via constructor. Every agent call
- *   records latency, token usage, estimated cost, and success/failure state.
+ * All bug fixes from v2 (BUG 1–4) are preserved unchanged.
+ * All GAP 1 (blackboard) and GAP 3 (observability) work is preserved.
  */
 class AgentDispatcherService
 {
-    /**
-     * Maps a domain intent string to its specialist agent FQCN.
-     * Update this map whenever a new specialist is added.
-     */
-    private const AGENT_MAP = [
-        'invoice'   => InvoiceAgent::class,
-        'client'    => ClientAgent::class,
-        'inventory' => InventoryAgent::class,
-        'narration' => NarrationAgent::class,
-        'business'  => BusinessProfileAgent::class,
-    ];
-
-    /**
-     * Maps intent to the model name used by its specialist.
-     * Used for accurate per-agent cost estimation in ObservabilityService.
-     * Keep in sync with each agent's #[Model(...)] attribute.
-     */
-    private const AGENT_MODELS = [
-        'invoice'   => 'gpt-4o',
-        'client'    => 'gpt-4o',
-        'inventory' => 'gpt-4o',
-        'narration' => 'gpt-4o',
-        'business'  => 'gpt-4o',
-    ];
-
     public function __construct(
         private readonly ObservabilityService $observability,
     ) {}
 
     /**
-     * Dispatch multiple intents sequentially, sharing an AgentContextBlackboard
-     * so each specialist can read the prior agent's output before prompting.
-     *
-     * Sequential dispatch is intentional: multi-intent turns often have data
-     * dependencies (ClientAgent creates the client → InvoiceAgent uses that ID).
-     * The blackboard eliminates redundant lookups across this dependency chain.
+     * Dispatch multiple intents sequentially, sharing an AgentContextBlackboard.
      *
      * @param  string[]    $intents
      * @param  User        $user
      * @param  string      $message
      * @param  string|null $conversationId
      * @param  array       $attachments
-     * @param  bool        $hitlConfirmed   True when this dispatch originates from a
-     *                                      HITL confirm() call — agents must skip their
-     *                                      own internal re-confirmation prompts.
+     * @param  bool        $hitlConfirmed
      * @return array<string, array{reply: string, conversation_id: ?string}>
      */
     public function dispatchAll(
@@ -124,15 +82,9 @@ class AgentDispatcherService
 
             $results[$intent] = $result;
 
-            // GAP 1: write this agent's reply to the blackboard so the next
-            // specialist can reference it without a redundant tool call.
             $blackboard->record($intent, $result['reply']);
 
-            // BUG 4 FIX: strip the ":intent" scope suffix before storing
-            // the base conversation ID. In the old code, when conversationId
-            // was null (new session), the first response held a scoped ID
-            // (e.g. "uuid-here:invoice"). Storing that as the base caused the
-            // second agent to receive "uuid-here:invoice:client" — wrong.
+            // BUG 4 FIX: strip ":intent" scope suffix when capturing base ID
             if ($index === 0 && $baseConversationId === null) {
                 $rawId = $result['conversation_id'] ?? null;
 
@@ -151,11 +103,11 @@ class AgentDispatcherService
      * @param  string                      $intent
      * @param  User                        $user
      * @param  string                      $message
-     * @param  string|null                 $conversationId  Base (unscoped) ID
+     * @param  string|null                 $conversationId
      * @param  bool                        $multiIntent
      * @param  array                       $attachments
-     * @param  AgentContextBlackboard|null $blackboard      Shared context from prior agents
-     * @param  bool                        $hitlConfirmed   Skip agent's own re-confirmation
+     * @param  AgentContextBlackboard|null $blackboard
+     * @param  bool                        $hitlConfirmed
      * @return array{reply: string, conversation_id: ?string}
      */
     public function dispatch(
@@ -169,12 +121,11 @@ class AgentDispatcherService
         bool                    $hitlConfirmed   = false,
     ): array {
         $start = microtime(true);
-        $model = self::AGENT_MODELS[$intent] ?? 'gpt-4o';
+        $model = AgentRegistry::AGENT_MODELS[$intent] ?? 'gpt-4o';
 
         try {
             $agent = $this->resolveAgent($intent, $user);
 
-            // BUG 1 FIX: conversation ID is now properly scoped per-intent
             $agent = $this->configureConversation(
                 agent:          $agent,
                 user:           $user,
@@ -191,7 +142,6 @@ class AgentDispatcherService
                 'blackboard_has'  => $blackboard?->all() ? array_keys($blackboard->all()) : [],
             ]);
 
-            // GAP 1: build message with blackboard context preamble injected
             $prompt = $this->buildMessage(
                 intent:        $intent,
                 message:       $message,
@@ -207,17 +157,10 @@ class AgentDispatcherService
 
             $latencyMs = (int) ((microtime(true) - $start) * 1000);
 
-            // GAP 3: record per-agent observability metrics.
-            //
-            // WHY DB READ — NOT $response->usage:
-            //   The Laravel AI SDK writes the `usage` JSON to the
-            //   agent_conversation_messages row DURING or AFTER prompt() returns.
-            //   By the time execution reaches this line, $response->usage is null
-            //   on the response object — the data hasn't been set on it yet.
-            //   The DB row, however, was committed synchronously by the SDK's
-            //   persistence layer before prompt() returned control.
-            //   Reading the most recent assistant row is safe: prompt() is
-            //   synchronous and sequential, so there is no race condition.
+            // ── Outcome signal (IBM AgentOps evaluation layer) ─────────────
+            $outcomeSignal = $this->resolveOutcomeSignal($intent, $response);
+
+            // ── Token usage from DB (see v2 comment for why DB not $response) ─
             $scopedConversationId = $response->conversationId;
             $usageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $scopedConversationId)
@@ -239,9 +182,9 @@ class AgentDispatcherService
                 inputTokens:    $inputTokens,
                 outputTokens:   $outputTokens,
                 success:        true,
+                outcomeSignal:  $outcomeSignal,
             );
 
-            // BUG 3 FIX: PHP-side JSON mutation — no DB::raw string interpolation
             $this->writeMetaToMessage(
                 conversationId: $response->conversationId,
                 intent:         $intent,
@@ -256,7 +199,6 @@ class AgentDispatcherService
         } catch (\Throwable $e) {
             $latencyMs = (int) ((microtime(true) - $start) * 1000);
 
-            // GAP 3: record failure metrics
             $this->observability->recordAgentCall(
                 intent:         $intent,
                 userId:         (string) $user->id,
@@ -265,6 +207,7 @@ class AgentDispatcherService
                 latencyMs:      $latencyMs,
                 success:        false,
                 errorMessage:   $e->getMessage(),
+                outcomeSignal:  'error',
             );
 
             Log::error("[AgentDispatcherService] {$intent} agent failed", [
@@ -273,9 +216,6 @@ class AgentDispatcherService
                 'trace'   => $e->getTraceAsString(),
             ]);
 
-            // BUG 2 FIX: return array, not bare string.
-            // The old errorResponse() returned a string; dispatchAll() expected
-            // array{reply, conversation_id} and crashed with TypeError.
             return [
                 'reply'           => $this->errorResponse($intent),
                 'conversation_id' => $conversationId,
@@ -287,33 +227,28 @@ class AgentDispatcherService
 
     /**
      * Instantiate the specialist agent for the given intent.
+     * Reads from AgentRegistry — no local AGENT_MAP needed.
      *
      * @throws \InvalidArgumentException If the intent has no registered agent.
      */
     private function resolveAgent(string $intent, User $user): Agent
     {
-        if (!isset(self::AGENT_MAP[$intent])) {
+        $agents = AgentRegistry::AGENTS;
+
+        if (!isset($agents[$intent])) {
             throw new \InvalidArgumentException(
                 "No agent registered for intent: {$intent}"
             );
         }
 
-        $class = self::AGENT_MAP[$intent];
+        $class = $agents[$intent];
 
         return new $class($user);
     }
 
     /**
      * Configure the agent's conversation context.
-     *
-     * BUG 1 FIX — scoping strategy:
-     *   - Single-intent : use conversationId directly (unchanged behaviour).
-     *   - Multi-intent  : scope as "{conversationId}:{intent}" so each specialist
-     *     maintains independent memory. The frontend never sees scoped IDs.
-     *
-     * Previously this method received $intent and $multiIntent but never used them,
-     * causing all agents in a multi-intent turn to share the same conversation
-     * history — a silent cross-contamination bug.
+     * BUG 1 FIX: scopes conversation ID per-intent for multi-intent turns.
      */
     private function configureConversation(
         Agent   $agent,
@@ -323,7 +258,6 @@ class AgentDispatcherService
         bool    $multiIntent,
     ): Agent {
         if ($conversationId === null) {
-            // New session — SDK assigns a fresh conversation ID
             return $agent->forUser($user);
         }
 
@@ -335,16 +269,56 @@ class AgentDispatcherService
     }
 
     /**
-     * Build the final prompt string to send to the specialist.
+     * Resolve the IBM AgentOps outcome signal for a completed agent call.
      *
-     * Injects up to three layers (when applicable):
-     *   1. HITL pre-authorization block — tells the agent this action was
-     *      already confirmed by the human via the HITL checkpoint. The agent
-     *      must NOT ask for confirmation again; it must execute immediately.
-     *   2. Blackboard context preamble — prior agents' completed work so this
-     *      specialist can avoid redundant tool calls (GAP 1).
-     *   3. Intent-scoping block — ensures the specialist ignores other domains
-     *      in a multi-intent message.
+     * Uses BaseAgent::writeTools() to determine whether the agent performed
+     * a write operation, then checks the response text for trailing questions.
+     *
+     * Falls back to null if the agent class doesn't extend BaseAgent or if
+     * the SDK response doesn't expose toolsUsed (safe — null is handled by
+     * ObservabilityService as "signal not available").
+     *
+     * @return string|null  'completed' | 'clarifying' | 'partial' | null
+     */
+    private function resolveOutcomeSignal(string $intent, mixed $response): ?string
+    {
+        $agentClass = AgentRegistry::AGENTS[$intent] ?? null;
+
+        // Only BaseAgent subclasses declare writeTools()
+        if ($agentClass === null || !is_subclass_of($agentClass, BaseAgent::class)) {
+            return null;
+        }
+
+        $writeTools = $agentClass::writeTools();
+
+        // If this agent has no write tools, it is read-only — outcome = 'completed'
+        // (reading successfully is a completion for a read-only agent)
+        if (empty($writeTools)) {
+            return 'completed';
+        }
+
+        // Check whether the SDK response exposes toolsUsed
+        $toolsUsed = $response->toolsUsed ?? null;
+
+        if ($toolsUsed === null) {
+            // SDK doesn't expose it yet — return null rather than guess
+            return null;
+        }
+
+        $calledWriteTool = !empty(array_intersect($toolsUsed, $writeTools));
+        $replyText       = (string) $response;
+        $endsWithQuestion = str_ends_with(rtrim($replyText), '?');
+
+        return match (true) {
+            $calledWriteTool && !$endsWithQuestion => 'completed',
+            $calledWriteTool && $endsWithQuestion  => 'partial',
+            default                                 => 'clarifying',
+        };
+    }
+
+    /**
+     * Build the final prompt string for the specialist.
+     * Injects HITL pre-authorisation, blackboard context, and intent scoping.
      */
     private function buildMessage(
         string                  $intent,
@@ -353,11 +327,6 @@ class AgentDispatcherService
         bool                    $multiIntent,
         bool                    $hitlConfirmed  = false,
     ): string {
-        // ── Layer 1: HITL pre-authorization ───────────────────────────────
-        // Injected FIRST so it overrides any "confirm before acting" rule in
-        // the agent's own instructions. Without this, agents with deletion
-        // confirmation rules (ClientAgent, InvoiceAgent, etc.) will ask the
-        // user to confirm again even though HITL already handled it.
         $hitlBlock = '';
         if ($hitlConfirmed) {
             $hitlBlock = <<<HITL
@@ -377,7 +346,6 @@ class AgentDispatcherService
             HITL;
         }
 
-        // ── Layer 2: Blackboard context ───────────────────────────────────
         $preamble = ($blackboard !== null && !$blackboard->isEmpty())
             ? $blackboard->buildContextPreamble($intent)
             : '';
@@ -386,7 +354,6 @@ class AgentDispatcherService
             return $hitlBlock . $preamble . $message;
         }
 
-        // ── Layer 3: Intent-scoping (multi-intent only) ───────────────────
         return <<<PROMPT
         {$hitlBlock}{$preamble}The user message may contain requests for multiple domains.
 
@@ -407,9 +374,7 @@ class AgentDispatcherService
 
     /**
      * Atomically update the meta column on the latest assistant message.
-     *
-     * BUG 3 FIX — PHP-side JSON mutation replaces the old DB::raw string
-     * interpolation, which was an SQL injection vector via the $intent variable.
+     * BUG 3 FIX: PHP-side JSON mutation — no DB::raw interpolation.
      */
     private function writeMetaToMessage(
         ?string $conversationId,
@@ -432,9 +397,8 @@ class AgentDispatcherService
                 return;
             }
 
-            // Decode existing meta safely, merge, re-encode — no raw SQL
-            $meta                = json_decode($messageRow->meta ?? '{}', true) ?: [];
-            $meta['intent']      = $intent;
+            $meta                 = json_decode($messageRow->meta ?? '{}', true) ?: [];
+            $meta['intent']       = $intent;
             $meta['multi_intent'] = $multiIntent;
 
             DB::table('agent_conversation_messages')
@@ -446,20 +410,13 @@ class AgentDispatcherService
     /**
      * Build a domain-specific error message for the user.
      * Never exposes internal details or stack traces.
+     * Reads labels from AgentRegistry keys — no hardcoded list.
      */
     private function errorResponse(string $intent): string
     {
-        $labels = [
-            'invoice'   => 'invoice operations',
-            'client'    => 'client management',
-            'inventory' => 'inventory management',
-            'narration' => 'narration head management',
-            'business'  => 'business profile operations',
-        ];
+        $label = ucfirst($intent);
 
-        $label = $labels[$intent] ?? $intent;
-
-        return "I encountered an issue with {$label}. Please try again in a moment. "
+        return "I encountered an issue with {$label} operations. Please try again in a moment. "
             . "If the problem persists, please contact support.";
     }
 }

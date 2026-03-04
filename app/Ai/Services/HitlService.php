@@ -2,57 +2,49 @@
 
 namespace App\Ai\Services;
 
+use App\Ai\AgentRegistry;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 /**
- * HitlService  (Human-in-the-Loop)
+ * HitlService  (v3 — AgentRegistry-driven GUARDED_INTENTS)
  *
  * Implements IBM's governance pattern: a hard checkpoint BEFORE any destructive
- * operation is dispatched to a specialist agent. The agent never executes the
- * delete/destructive action until the user explicitly confirms via a second
- * HTTP request.
- *
- * IBM alignment:
- *   - "Human-in-the-loop: ensure humans can review and approve agent actions"
- *   - "AI agent governance: guardrails for safe and ethical agents"
- *   - "Agentic AI: humans remain in control of high-stakes decisions"
+ * operation is dispatched to a specialist agent.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * TWO-PHASE DISPATCH FLOW
+ * CHANGE FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Phase 1 — Proposal (automatic, ChatOrchestrator::handle):
- *   1. User sends: "Delete the invoice for Acme Corp"
- *   2. HitlService::requiresCheckpoint() returns true
- *   3. Action is stored in Cache with a UUID (pending_id), TTL = 15 min
- *   4. Orchestrator returns: reply = warning message, hitl_pending = true,
- *      pending_id = "<uuid>"
- *   5. Frontend renders the warning + "Confirm" / "Cancel" buttons
+ * v2 hardcoded:
+ *   private const GUARDED_INTENTS = ['invoice', 'client', 'inventory', 'narration'];
  *
- * Phase 2 — Execution (user-triggered, ChatOrchestrator::confirm):
- *   1. User clicks "Confirm"
- *   2. Frontend POSTs to /ai/chat/confirm with pending_id
- *   3. HitlService::consumePendingAction() retrieves and deletes the cached action
- *   4. Orchestrator re-dispatches to the specialist — this time without
- *      re-triggering the HITL check (confirmed actions bypass it)
- *   5. Specialist executes the destructive operation
+ * This meant adding a new destructive agent (e.g. PayrollAgent) required
+ * manually editing this constant — a maintenance trap that would silently
+ * fail (no HITL checkpoint) if the developer forgot.
+ *
+ * v3 derives the guarded intents dynamically from AgentRegistry:
+ *   AgentRegistry::destructiveIntents()
+ *   → returns all intents whose agent declares AgentCapability::DESTRUCTIVE
+ *   → called once at checkpoint evaluation time (no caching needed — it's a
+ *     static array_filter, sub-microsecond)
+ *
+ * Adding a new destructive agent now requires ZERO changes to this file.
+ * The agent simply declares AgentCapability::DESTRUCTIVE in getCapabilities()
+ * and it is automatically guarded.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHAT COUNTS AS DESTRUCTIVE
+ * IBM ALIGNMENT
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Detected by keyword pattern on the raw user message:
- *   delete / remove / destroy / drop / erase / wipe / cancel / void / purge
+ * IBM HITL governance (ibm.com/think/tutorials/human-in-the-loop-ai-agent):
+ *   "Human-in-the-loop: ensure humans can review and approve agent actions
+ *    before irreversible operations are executed."
  *
- * Only applied to guarded intents (not 'business' — profile updates are safe
- * because the agent already confirms before writing).
- *
- * To extend: add patterns to DESTRUCTIVE_PATTERNS, add/remove intents from
- * GUARDED_INTENTS. The check is intentionally conservative — false positives
- * (checkpoint triggered when not needed) are far less damaging than false
- * negatives (destructive action executed without confirmation).
+ * IBM on conservative checkpointing:
+ *   "False positives (checkpoint triggered unnecessarily) are far less damaging
+ *    than false negatives (destructive action without confirmation)."
  */
 class HitlService
 {
@@ -65,33 +57,31 @@ class HitlService
     /**
      * Regex patterns that signal a potentially destructive operation.
      * Evaluated against the raw user message (case-insensitive).
+     *
+     * To extend: add new patterns here. The intent guard is handled separately
+     * via AgentRegistry::destructiveIntents() — no other changes needed.
      */
     private const DESTRUCTIVE_PATTERNS = [
         '/\b(delete|remove|destroy|drop|erase|wipe|cancel|void|purge)\b/i',
     ];
 
     /**
-     * Intents where destructive-pattern matching is enforced.
-     * 'business' is excluded — the agent enforces confirmation in its own prompt.
-     * 'narration' is included — deleting ledger heads affects all accounting records.
-     */
-    private const GUARDED_INTENTS = [
-        'invoice',
-        'client',
-        'inventory',
-        'narration',
-    ];
-
-    /**
      * Determine whether a HITL checkpoint is required for this turn.
      *
      * Returns true only when ALL of these conditions hold:
-     *   1. At least one resolved intent is in GUARDED_INTENTS
+     *   1. At least one resolved intent belongs to a DESTRUCTIVE agent
+     *      (derived dynamically from AgentRegistry — no hardcoded list)
      *   2. The raw user message matches a destructive keyword pattern
+     *
+     * @param  string   $message  Raw user message
+     * @param  string[] $intents  Resolved domain intents
      */
     public function requiresCheckpoint(string $message, array $intents): bool
     {
-        $guardedMatches = array_intersect($intents, self::GUARDED_INTENTS);
+        // Derive guarded intents dynamically — automatically includes any new
+        // agent that declares AgentCapability::DESTRUCTIVE
+        $guardedIntents = AgentRegistry::destructiveIntents();
+        $guardedMatches = array_intersect($intents, $guardedIntents);
 
         if (empty($guardedMatches)) {
             return false;
@@ -100,8 +90,9 @@ class HitlService
         foreach (self::DESTRUCTIVE_PATTERNS as $pattern) {
             if (preg_match($pattern, $message)) {
                 Log::info('[HitlService] Destructive pattern matched', [
-                    'intents' => $intents,
-                    'pattern' => $pattern,
+                    'intents'        => $intents,
+                    'guarded_intents' => $guardedIntents,
+                    'pattern'        => $pattern,
                 ]);
                 return true;
             }

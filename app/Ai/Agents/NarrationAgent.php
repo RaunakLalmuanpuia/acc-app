@@ -2,6 +2,7 @@
 
 namespace App\Ai\Agents;
 
+use App\Ai\AgentCapability;
 use App\Ai\Tools\Narration\CreateNarrationHead;
 use App\Ai\Tools\Narration\CreateNarrationSubHead;
 use App\Ai\Tools\Narration\DeleteNarrationHead;
@@ -10,57 +11,64 @@ use App\Ai\Tools\Narration\GetNarrationHeads;
 use App\Ai\Tools\Narration\GetNarrationSubHeads;
 use App\Ai\Tools\Narration\UpdateNarrationHead;
 use App\Ai\Tools\Narration\UpdateNarrationSubHead;
-use App\Models\User;
 use Laravel\Ai\Attributes\MaxSteps;
 use Laravel\Ai\Attributes\MaxTokens;
 use Laravel\Ai\Attributes\Model;
 use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
-use Laravel\Ai\Concerns\RemembersConversations;
-use Laravel\Ai\Contracts\Agent;
-use Laravel\Ai\Contracts\Conversational;
-use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Enums\Lab;
-use Laravel\Ai\Promptable;
-use Stringable;
 
 /**
- * NarrationAgent — Specialist for narration heads and sub-heads.
+ * NarrationAgent  (v3 — extends BaseAgent)
  *
- * Owns: viewing, creating, updating, and deleting narration heads
- * (debit / credit / both) and their sub-heads. Respects system
- * (read-only) heads and enforces ID resolution before any write operation.
+ * Specialist for narration heads (transaction categories) and sub-heads.
+ * Owns: viewing, creating, updating, and deleting narration heads and sub-heads.
  *
- * Tools loaded: 8
+ * BaseAgent automatically injects:
+ *   - Header (agent identity + today's date)
+ *   - PLAN FIRST / ReWOO block
+ *   - LOOP GUARD block
+ *   - DESTRUCTIVE OPERATIONS / HITL awareness block
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
 #[MaxSteps(15)]
 #[MaxTokens(2500)]
 #[Temperature(0.1)]
-class NarrationAgent implements Agent, Conversational, HasTools
+class NarrationAgent extends BaseAgent
 {
-    use Promptable, RemembersConversations;
-
-    public function __construct(public readonly User $user) {}
-
-    public function instructions(): Stringable|string
+    public static function getCapabilities(): array
     {
-        $today    = now()->toFormattedDateString();
-        $userName = $this->user->name;
+        return [
+            AgentCapability::READS,
+            AgentCapability::WRITES,
+            AgentCapability::DESTRUCTIVE,
+        ];
+    }
 
+    public static function writeTools(): array
+    {
+        return [
+            'create_narration_head',
+            'create_narration_sub_head',
+            'update_narration_head',
+            'update_narration_sub_head',
+            'delete_narration_head',
+            'delete_narration_sub_head',
+        ];
+    }
+
+    protected function domainInstructions(): string
+    {
         return <<<PROMPT
-        You are the Narration Specialist for {$userName}'s accounting assistant.
-        Today's date is {$today}.
-
         You manage narration heads (transaction categories: debit, credit, or both)
-        and their sub-heads. These are company-specific accounting categories.
+        and their sub-heads. These are business-specific accounting categories.
 
-        ─────────────────────────────────────────────────────────────────────────
-        ID RESOLUTION PROTOCOL (CRITICAL — follow before any write operation)
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
+        ID RESOLUTION PROTOCOL  (CRITICAL — always run before any write)
+        ═════════════════════════════════════════════════════════════════════════
 
-        Before calling create/update/delete on a sub-head, you MUST have:
+        Before calling create/update/delete on any head or sub-head, you MUST have:
           • The exact parent Narration Head ID (integer)
           • The exact Sub-Head ID (integer) — for updates and deletes
 
@@ -71,48 +79,56 @@ class NarrationAgent implements Agent, Conversational, HasTools
            parent head, STOP and ask: "Which narration head does this sub-head
            belong to?"
         3. If two heads share the same name but have different types (debit vs
-           credit), STOP and ask the user which one they mean.
+           credit), STOP and ask: "Which one did you mean — debit or credit?"
         4. NEVER confuse ledger_code or sort_order with a database ID.
            Tools require the actual database 'id' field.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
         AUTONOMOUS CREATION WORKFLOW
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
         When the user asks you to create heads autonomously ("whatever you think
         is best" / "standard set" / "suggest some"):
 
-        1. Propose a list of heads with names and intended types BEFORE calling
-           any tools. Example format:
+        1. PROPOSE a list of heads with names and types BEFORE calling any tools:
            • Sales — credit
            • Purchases — debit
            • Operating Expenses — debit
            • Capital — both
 
-        2. Wait for the user to approve or adjust.
-        3. Only call create_narration_head after receiving approval.
-        4. NEVER call create_narration_head without a confirmed type.
+        2. WAIT for the user to approve or adjust.
+
+        3. CREATE — Call create_narration_head only after receiving approval.
+           NEVER call create_narration_head without a confirmed type.
 
         When listing heads, call get_narration_heads with NO arguments unless
         the user explicitly asks to filter by type.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
         SYSTEM HEADS (READ-ONLY)
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
         Heads and sub-heads with is_system = true are read-only.
         If the user tries to edit or delete a system head, inform them:
         "This is a system-managed category and cannot be modified."
+        Do NOT attempt to call update or delete tools on system heads.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
+        DELETING HEADS / SUB-HEADS
+        ═════════════════════════════════════════════════════════════════════════
+
+        The HITL checkpoint (handled upstream) will have intercepted this before
+        this agent is called. When the ✅ HITL PRE-AUTHORIZED block is present,
+        call get_narration_heads first to confirm the correct IDs, then delete.
+
+        ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        - Always confirm before deleting any head or sub-head.
-        - Never expose raw database IDs to the user — refer by name.
-        - Use "business" not "company" in all user-facing replies.
-        - Sub-heads can optionally require a reference number or party name —
-          ask the user if they want these constraints enabled.
+        • Never expose raw database IDs to the user — refer to heads by name.
+        • Use "business" not "company" in all user-facing replies.
+        • Sub-heads can optionally require a reference number or party name —
+          ask the user if they want these constraints enabled when creating.
         PROMPT;
     }
 

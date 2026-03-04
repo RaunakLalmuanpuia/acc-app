@@ -2,60 +2,56 @@
 
 namespace App\Ai\Services;
 
+use App\Ai\AgentRegistry;
 use App\Ai\Agents\RouterAgent;
 use Illuminate\Support\Facades\Log;
 
 /**
- * IntentRouterService  (v2 — Gap 2 fixed)
+ * IntentRouterService  (v3 — AgentRegistry-driven VALID_DOMAIN_INTENTS)
  *
  * Encapsulates all logic for calling the RouterAgent, parsing its JSON output,
  * validating intents, and gracefully recovering from failure.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * GAP 2 FIX — RouterAgent failure fallback
+ * CHANGE FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * BEFORE (v1):
- *   On RouterAgent failure, return json_encode(['intents' => VALID_DOMAIN_INTENTS])
- *   → Dispatches ALL 5 specialist agents (5x gpt-4o calls for a routing failure).
- *   → Expensive and produces a multi-section reply that confuses the user.
+ * v2 hardcoded:
+ *   public const VALID_DOMAIN_INTENTS = ['invoice','client','inventory','narration','business'];
  *
- * AFTER (v2):
- *   On RouterAgent failure, return json_encode(['intents' => ['unknown']])
- *   → 'unknown' is filtered out by filterValid(), resolve() returns []
- *   → ChatOrchestrator's DB fallback (getLastIntent) tries to recover from
- *     conversation history instead.
- *   → If DB fallback also finds nothing, the static unknownResponse() is
- *     returned — zero AI cost, no confusing multi-domain noise.
+ * This was a second place (alongside AgentDispatcherService::AGENT_MAP) that
+ * needed manual updating whenever a new agent was added.
  *
- * This is the correct failure mode: a routing failure should be cheap and quiet,
- * not loud and expensive.
+ * v3 derives the valid intents from AgentRegistry::validIntents() — a single
+ * call that reads the keys of AgentRegistry::AGENTS. Adding a new agent to
+ * the registry automatically makes its intent valid here.
+ *
+ * The constant is kept as a public getter method (validDomainIntents()) for
+ * backwards compatibility with any tests that reference it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * SAME PARSE FALLBACK LOGIC — also fixed
+ * GAP 2 FIX (carried from v2)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * BEFORE: parseIntents() returned VALID_DOMAIN_INTENTS on JSON parse failure,
- *   again triggering all 5 agents unnecessarily.
- *
- * AFTER: parseIntents() returns [] on JSON parse failure, letting the DB
- *   fallback or unknownResponse() handle it.
+ * On RouterAgent failure → return ['unknown'] not all domain intents.
+ * On JSON parse failure  → return []          not all domain intents.
+ * Both let the orchestrator's DB fallback or unknownResponse() handle it
+ * at zero additional AI cost.
  */
 class IntentRouterService
 {
-    /**
-     * Domain intents that map to specialist agents.
-     * Any intent NOT in this list (including 'unknown') is filtered out.
-     */
-    public const VALID_DOMAIN_INTENTS = [
-        'invoice',
-        'client',
-        'inventory',
-        'narration',
-        'business',
-    ];
-
     public function __construct(private readonly RouterAgent $router) {}
+
+    /**
+     * Return the valid domain intents derived from AgentRegistry.
+     * Replaces the old VALID_DOMAIN_INTENTS constant.
+     *
+     * @return string[]
+     */
+    public function validDomainIntents(): array
+    {
+        return AgentRegistry::validIntents();
+    }
 
     /**
      * Route a user message to one or more domain intents.
@@ -80,12 +76,9 @@ class IntentRouterService
     /**
      * Prompt the RouterAgent and return the raw response string.
      *
-     * GAP 2 FIX: On failure, return ['unknown'] instead of all domain intents.
-     * This lets the orchestrator's DB fallback (getLastIntent) take over, or
-     * fall through to the zero-cost unknownResponse() static reply.
-     *
-     * The old "route to all domains" fallback was expensive (5x gpt-4o calls)
-     * and produced a confusing multi-domain response for what was a routing error.
+     * On failure: return ['unknown'] so the orchestrator's DB fallback
+     * (getLastIntent) can attempt recovery — or fall through to the zero-cost
+     * unknownResponse() static reply.
      */
     private function callRouter(string $message): string
     {
@@ -98,9 +91,6 @@ class IntentRouterService
                 'trace' => $e->getTraceAsString(),
             ]);
 
-            // Return 'unknown' — the orchestrator's DB fallback will attempt
-            // to recover from conversation history. If that also fails, the
-            // static unknownResponse() is returned at zero AI cost.
             return json_encode(['intents' => ['unknown']]);
         }
     }
@@ -113,12 +103,10 @@ class IntentRouterService
      *  - Model returns invalid JSON
      *  - 'intents' key is missing or not an array
      *
-     * GAP 2 FIX: On parse failure, return [] instead of VALID_DOMAIN_INTENTS.
-     * Prevents unnecessary 5-agent dispatch on a parse error.
+     * On parse failure: return [] (not all intents — prevents 5-agent dispatch).
      */
     private function parseIntents(string $raw): array
     {
-        // Strip markdown code fences if the model accidentally wraps its output
         $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $raw);
         $cleaned = preg_replace('/\s*```$/', '', $cleaned ?? $raw);
         $cleaned = trim($cleaned ?? $raw);
@@ -131,7 +119,7 @@ class IntentRouterService
                 'error' => $e->getMessage(),
             ]);
 
-            return []; // GAP 2 FIX: was VALID_DOMAIN_INTENTS — too expensive on failure
+            return [];
         }
 
         if (!isset($decoded['intents']) || !is_array($decoded['intents'])) {
@@ -139,7 +127,7 @@ class IntentRouterService
                 'decoded' => $decoded,
             ]);
 
-            return []; // GAP 2 FIX: was VALID_DOMAIN_INTENTS
+            return [];
         }
 
         return $decoded['intents'];
@@ -149,12 +137,14 @@ class IntentRouterService
      * Filter parsed intents to only those that have a registered agent.
      * 'unknown' and any unrecognised strings are dropped.
      * Deduplicates the result.
+     *
+     * Uses AgentRegistry::validIntents() — automatically includes any new agent.
      */
     private function filterValid(array $intents): array
     {
         return array_values(
             array_unique(
-                array_intersect($intents, self::VALID_DOMAIN_INTENTS)
+                array_intersect($intents, AgentRegistry::validIntents())
             )
         );
     }

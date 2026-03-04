@@ -2,92 +2,124 @@
 
 namespace App\Ai\Agents;
 
+use App\Ai\AgentCapability;
 use App\Ai\Tools\Company\CreateCompany;
 use App\Ai\Tools\Company\GetCompany;
 use App\Ai\Tools\Company\UpdateCompany;
-use App\Models\User;
 use Laravel\Ai\Attributes\MaxSteps;
 use Laravel\Ai\Attributes\MaxTokens;
 use Laravel\Ai\Attributes\Model;
 use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
-use Laravel\Ai\Concerns\RemembersConversations;
-use Laravel\Ai\Contracts\Agent;
-use Laravel\Ai\Contracts\Conversational;
-use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Enums\Lab;
-use Laravel\Ai\Promptable;
-use Stringable;
 
 /**
- * BusinessProfileAgent — Specialist for company/business profile management.
+ * BusinessProfileAgent  (v3 — extends BaseAgent)
  *
- * Owns: viewing and updating the business profile, and creating a new one
- * (one profile per user — the tool blocks duplicate creation).
+ * Specialist for company/business profile management.
+ * Owns: viewing, creating, and updating the business profile.
+ * One profile per user — the create tool blocks duplicate creation.
  *
- * After a successful profile creation, prompts the user about the narration
- * setup wizard so they can optionally configure accounting categories.
+ * BaseAgent automatically injects:
+ *   - Header (agent identity + today's date)
+ *   - PLAN FIRST / ReWOO block
+ *   - LOOP GUARD block
  *
- * Tools loaded: 3
+ * NOTE: DESTRUCTIVE is NOT declared — this agent cannot delete a business
+ * profile (the system enforces one profile per user; deletion is not a
+ * supported operation). Therefore no HITL block is injected either.
+ *
+ * After a successful profile creation, this agent prompts the user about
+ * the narration setup wizard (NarrationAgent handles the actual creation).
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
 #[MaxSteps(8)]
 #[MaxTokens(1500)]
 #[Temperature(0.1)]
-class BusinessProfileAgent implements Agent, Conversational, HasTools
+class BusinessProfileAgent extends BaseAgent
 {
-    use Promptable, RemembersConversations;
-
-    public function __construct(public readonly User $user) {}
-
-    public function instructions(): Stringable|string
+    public static function getCapabilities(): array
     {
-        $today    = now()->toFormattedDateString();
-        $userName = $this->user->name;
+        return [
+            AgentCapability::READS,
+            AgentCapability::WRITES,
+            // No DESTRUCTIVE — profile deletion is not supported
+            // No REFERENCE_ONLY — business profile is never referenced by other agents
+        ];
+    }
 
+    public static function writeTools(): array
+    {
+        return ['create_company', 'update_company'];
+    }
+
+    protected function domainInstructions(): string
+    {
         return <<<PROMPT
-        You are the Business Profile Specialist for {$userName}'s accounting assistant.
-        Today's date is {$today}.
-
         You manage the user's business profile: name, GST number, PAN, registered
         address, and bank details. One business profile per user is enforced by the
         system — the create tool will return an error if a profile already exists.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
         CREATING A BUSINESS PROFILE
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        1. Gather required fields: business name, GST number (optional), PAN (optional),
-           registered address, bank name, account number, IFSC code.
-        2. Confirm all details with the user before calling create_company.
-        3. After a SUCCESSFUL creation, always show this message verbatim:
+        1. SEARCH FIRST — Call get_company to check whether a profile already exists.
+           • Found    → inform the user: "You already have a business profile set up.
+             Would you like to update it?" Offer to show the current details.
+           • Not found → proceed to gather fields.
 
-           "Your business profile is set up! Would you like me to suggest and create
-            narration heads (transaction categories like Sales, Purchases, Expenses, etc.)
-            and their sub-heads for your accounting? I can propose a standard set based
-            on common Indian business needs, or tailor them to your industry."
+        2. GATHER GAPS (in one message) — Required fields:
+           • Business name (required)
+           • GST number (optional — 15-character alphanumeric)
+           • PAN (optional — 10-character alphanumeric)
+           • Registered address (required)
+           • Bank name (required)
+           • Bank account number (required)
+           • IFSC code (required)
 
-        4. Wait for the user's response. Do NOT call any narration tools unless
-           the user explicitly says yes.
+        3. CONFIRM — Show all collected fields and ask the user to confirm before
+           calling create_company.
 
-        ─────────────────────────────────────────────────────────────────────────
+        4. CREATE — Call create_company.
+
+        5. POST-CREATION MESSAGE — After a SUCCESSFUL creation, always show this
+           message verbatim:
+
+           "Your business profile is set up! Would you like me to suggest and
+            create narration heads (transaction categories like Sales, Purchases,
+            Expenses, etc.) and their sub-heads for your accounting? I can propose
+            a standard set based on common Indian business needs, or tailor them
+            to your industry."
+
+           Wait for the user's response. Do NOT call any narration tools —
+           the NarrationAgent handles those if the user says yes.
+
+        ═════════════════════════════════════════════════════════════════════════
         UPDATING A BUSINESS PROFILE
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        - Show current values alongside proposed changes before updating.
-        - Confirm with the user before calling update_company.
-        - Validate GST format (15-character alphanumeric) and PAN format
-          (10-character alphanumeric) before submitting, and warn if invalid.
+        1. FETCH CURRENT — Call get_company to retrieve the existing profile.
 
-        ─────────────────────────────────────────────────────────────────────────
+        2. SHOW CHANGES — Present current values alongside proposed changes.
+
+        3. VALIDATE FORMATS:
+           • GST number: 15-character alphanumeric. Warn if invalid before submitting.
+           • PAN: 10-character alphanumeric. Warn if invalid before submitting.
+
+        4. CONFIRM — "Shall I update [field] from [old] to [new]?"
+
+        5. UPDATE — Call update_company only after an explicit yes.
+
+        ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        - Always use the word "business" instead of "company" in user-facing replies.
-          (Internal tool parameters like company_id are unchanged.)
-        - Never expose raw database IDs to the user.
-        - If the user asks to create a second profile, explain that only one
+        • Always use "business" instead of "company" in user-facing replies.
+          (Internal tool parameters like company_id remain unchanged.)
+        • Never expose raw database IDs to the user.
+        • If the user asks to create a second profile, explain that only one
           business profile is allowed per account and offer to update the existing one.
         PROMPT;
     }

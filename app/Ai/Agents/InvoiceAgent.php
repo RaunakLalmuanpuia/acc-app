@@ -2,6 +2,7 @@
 
 namespace App\Ai\Agents;
 
+use App\Ai\AgentCapability;
 use App\Ai\Tools\Client\GetClients;
 use App\Ai\Tools\Inventory\GetInventory;
 use App\Ai\Tools\Invoice\ConfirmInvoice;
@@ -11,130 +12,164 @@ use App\Ai\Tools\Invoice\GenerateInvoicePdf;
 use App\Ai\Tools\Invoice\GetInvoiceDetails;
 use App\Ai\Tools\Invoice\GetInvoices;
 use App\Ai\Tools\Invoice\UpdateInvoice;
-use App\Models\User;
 use Laravel\Ai\Attributes\MaxSteps;
 use Laravel\Ai\Attributes\MaxTokens;
 use Laravel\Ai\Attributes\Model;
 use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
-use Laravel\Ai\Concerns\RemembersConversations;
-use Laravel\Ai\Contracts\Agent;
-use Laravel\Ai\Contracts\Conversational;
-use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Enums\Lab;
-use Laravel\Ai\Promptable;
-use Stringable;
 
 /**
- * InvoiceAgent — Specialist for the full invoice lifecycle.
+ * InvoiceAgent  (v3 — extends BaseAgent, IBM ReWOO plan-first)
  *
+ * Specialist for the full invoice lifecycle.
  * Owns: draft creation, confirmation, updates, deletion, PDF generation,
- * payment recording, and client ID lookup (GetClients is included so this
- * agent can resolve client names to IDs without depending on another agent).
+ * payment recording, client ID resolution, and inventory item resolution.
  *
- * Tools loaded: 8  (vs 28 in the monolith — ~70% tool-schema reduction)
+ * BaseAgent automatically injects:
+ *   - Header (agent identity + today's date)
+ *   - PLAN FIRST / ReWOO block
+ *   - LOOP GUARD block
+ *   - DESTRUCTIVE OPERATIONS / HITL awareness block
+ *
+ * Tools: 9  (GetClients + GetInventory added for ReWOO plan-first lookups)
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(20)]
+#[MaxSteps(25)]
 #[MaxTokens(3000)]
 #[Temperature(0.1)]
-class InvoiceAgent implements Agent, Conversational, HasTools
+class InvoiceAgent extends BaseAgent
 {
-    use Promptable, RemembersConversations;
-
-    public function __construct(public readonly User $user) {}
-
-    public function instructions(): Stringable|string
+    public static function getCapabilities(): array
     {
-        $today    = now()->toFormattedDateString();
-        $userName = $this->user->name;
+        return [
+            AgentCapability::READS,
+            AgentCapability::WRITES,
+            AgentCapability::DESTRUCTIVE,
+        ];
+    }
 
+    public static function writeTools(): array
+    {
+        return [
+            'create_invoice_draft',
+            'confirm_invoice',
+            'update_invoice',
+            'delete_invoice',
+        ];
+    }
+
+    protected function domainInstructions(): string
+    {
         return <<<PROMPT
-        You are the Invoice Specialist for {$userName}'s accounting assistant.
-        Today's date is {$today}.
-
         You handle everything related to invoices: viewing, creating, updating,
         confirming, deleting, recording payments, and generating PDFs.
 
-        ─────────────────────────────────────────────────────────────────────────
-        MANDATORY INVOICE CREATION WORKFLOW (always follow this order exactly)
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
+        INVOICE CREATION WORKFLOW  (follow this order exactly)
+        ═════════════════════════════════════════════════════════════════════════
 
-        1. GATHER — Ask for: client name, line items (description, qty, rate, GST %),
-           invoice date, due date. Do not proceed without these.
+        ── PHASE 1: PLAN & LOOK UP (run silently before asking anything) ─────
 
-        2. LOOKUP CLIENT — Call get_clients with the client name to get the client_id.
-           Never guess or reuse a client_id from earlier in the conversation.
+        1. EXTRACT from the user's message everything already provided:
+           client name, item names, quantities, rates, dates.
 
-        3. CREATE DRAFT — Call create_invoice_draft. This returns a draft_ref.
-           Save this draft_ref — it is unique to this invoice.
+        2. RESOLVE CLIENT — Call get_clients with the client name.
+           • Found    → capture client_id. Do not ask the user for it.
+           • Not found → note it as a gap; collect in step 4.
 
-        4. PRESENT SUMMARY — Show a formatted table with:
-           - Each line item: description, qty, rate, taxable amount, GST, total
-           - Subtotals: CGST + SGST (intra-state) OR IGST (inter-state)
-           - Grand total in ₹ with two decimal places
-           - Supply type (intra-state / inter-state)
+        3. RESOLVE ITEMS — For each item mentioned, call get_inventory.
+           • Found    → capture rate, GST %, HSN code, unit. Do NOT ask the user
+             for these values if the item already exists in inventory.
+           • Not found → note rate and GST % as gaps; collect in step 4.
 
-        5. OFFER PDF PREVIEW — Ask: "Would you like to preview this as a PDF before confirming?"
-           If yes, call generate_invoice_pdf with the draft_ref from step 3.
+        ── PHASE 2: GAP-FILL (ask once, for everything still missing) ────────
 
-        6. ASK FOR CONFIRMATION — Ask explicitly: "Shall I confirm and issue this invoice?"
-           Do NOT confirm without an explicit yes from the user.
+        4. IDENTIFY GAPS — After steps 2–3, list every field still unknown:
+           • Client unresolved?    → ask for clarification.
+           • Rate missing?         → ask for rate.
+           • GST % missing?        → ask for GST %.
+           • Invoice date missing? → use today as default; do not ask.
+           • Due date missing?     → ask for due date.
 
-        7. CONFIRM — Only now call confirm_invoice with the draft_ref from step 3.
+           If all gaps are filled by defaults, skip to step 5 immediately.
+           If gaps remain, ask for ALL of them in a SINGLE consolidated message.
+           Example: "I found Infosys and Levis Jeans (₹800/unit, 12% GST).
+                     I just need: (1) the due date."
 
-        8. VERIFY CLIENT NAME — Read client_name from the confirm_invoice response.
-           Show it to the user: "Confirmed for [client_name] — does this match?"
-           Never assume the client name from conversation history is correct.
+        ── PHASE 3: CREATE & CONFIRM ─────────────────────────────────────────
 
-        9. OFFER FINAL PDF — After confirmation, offer to generate the final PDF.
+        5. CREATE DRAFT — Call create_invoice_draft with fully resolved data.
+           Save the returned draft_ref — it is unique to this invoice.
 
-        ─────────────────────────────────────────────────────────────────────────
-        CRITICAL: CREATING A SECOND INVOICE IN THE SAME CONVERSATION
-        ─────────────────────────────────────────────────────────────────────────
+        6. PRESENT SUMMARY — Show a formatted table:
+           • Each line item: description, qty, rate, taxable amount, GST, total
+           • Subtotals: CGST + SGST (intra-state) OR IGST (inter-state)
+           • Grand total in ₹ with two decimal places
+           • Supply type (intra-state / inter-state)
 
-        When the user asks to create another invoice after one was already created:
+        7. OFFER PDF PREVIEW — "Would you like to preview this as a PDF before
+           confirming?" If yes, call generate_invoice_pdf with the draft_ref.
 
-        - Start completely fresh from step 1. Ask for ALL details again.
-        - NEVER reuse the draft_ref, client_id, line items, or amounts from a
-          previous invoice — not even as defaults or suggestions.
-        - The draft_ref (e.g. DRAFT-699EC4B50B017) is unique per invoice.
-          Using an old draft_ref will confirm the WRONG invoice or cause an error.
+        8. ASK FOR CONFIRMATION — "Shall I confirm and issue this invoice?"
+           Do NOT confirm without an explicit yes.
 
-        Pre-confirm checklist (internal — verify before calling confirm_invoice):
-        ✓ draft_ref comes from the create_invoice_draft I JUST called, not from earlier.
-        ✓ Client, amounts, and line items match what the user requested THIS time.
+        9. CONFIRM — Call confirm_invoice with the draft_ref from step 5.
+
+        10. VERIFY CLIENT NAME — Read client_name from the confirm response.
+            Show: "Confirmed for [client_name] — does this match?"
+            Never assume the name from conversation history is correct.
+
+        11. OFFER FINAL PDF — After confirmation, offer to generate the final PDF.
+
+        ═════════════════════════════════════════════════════════════════════════
+        CRITICAL: SECOND INVOICE IN THE SAME CONVERSATION
+        ═════════════════════════════════════════════════════════════════════════
+
+        When creating another invoice after one was already created:
+        • Start completely fresh from Phase 1. Re-run get_clients and get_inventory.
+        • NEVER reuse a draft_ref, client_id, line items, or amounts from a prior
+          invoice — not even as defaults.
+        • draft_ref is unique per invoice. An old ref will confirm the wrong invoice.
+
+        Pre-confirm checklist (internal):
+        ✓ draft_ref is from the create_invoice_draft I JUST called.
+        ✓ Client, amounts, and items match what the user requested THIS time.
         ✓ User has explicitly said "yes", "confirm", or equivalent.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
         CRITICAL: PDF LINKS
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        - NEVER reuse a PDF URL from earlier in the conversation. Signed URLs expire.
-        - Every time the user asks for a PDF, call generate_invoice_pdf fresh.
-        - Never construct or guess a URL — always use the tool.
-        - After confirming a new invoice, the pdf_url in the confirm response is
-          valid for 60 minutes. Present it once; call the tool again if asked later.
+        • NEVER reuse a PDF URL from earlier in the conversation. Signed URLs expire.
+        • Call generate_invoice_pdf fresh every time the user asks for a PDF.
+        • Never construct or guess a URL — always use the tool.
+        • The pdf_url in the confirm response is valid for 60 minutes. Present it
+          once; call the tool again if asked later.
 
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR
-        ─────────────────────────────────────────────────────────────────────────
+        ═════════════════════════════════════════════════════════════════════════
 
-        - Present all monetary values in Indian Rupees (₹) with two decimal places.
-        - Use tables or bullet points for invoice summaries and line items.
-        - For "show my invoices" — fetch the last 15 and summarise by status.
-        - Always confirm before recording a payment (state amount + invoice number).
-        - Always confirm before deleting an invoice; warn if payments exist.
-        - Never expose raw database IDs to the user.
-        - Use "business" not "company" in all user-facing replies.
+        • Present all monetary values in Indian Rupees (₹) with two decimal places.
+        • Use tables or bullet points for invoice summaries and line items.
+        • For "show my invoices" — fetch the last 15 and summarise by status.
+        • Always confirm before recording a payment (state amount + invoice number).
+        • Always confirm before deleting; warn if payments exist.
+        • Never expose raw database IDs to the user.
+        • Use "business" not "company" in all user-facing replies.
         PROMPT;
     }
 
     public function tools(): iterable
     {
         return [
-            // Invoice tools
+            // Lookup tools — resolve client and inventory data before asking the user
+            new GetClients($this->user),
+            new GetInventory($this->user),
+
+            // Invoice lifecycle tools
             new GetInvoices($this->user),
             new GetInvoiceDetails($this->user),
             new CreateInvoiceDraft($this->user),

@@ -5,28 +5,57 @@ namespace App\Ai\Services;
 use Illuminate\Support\Facades\Log;
 
 /**
- * ObservabilityService
+ * ObservabilityService  (v3 — IBM AgentOps evaluation alignment)
  *
  * Implements IBM's AgentOps pattern: structured, per-agent telemetry for every
- * chat turn. Tracks latency, token spend, and failure rates so you can detect
- * degradation, control costs, and feed external APM tooling.
+ * chat turn. Tracks latency, token spend, failure rates, and — new in v3 —
+ * intent outcome signals so you can detect when an agent asked clarifying
+ * questions instead of completing the user's request.
  *
  * IBM alignment:
  *   - "AgentOps — tracking per-agent failure rates, latency, token spend"
- *   - "AI agent governance: processes and guardrails for safe and ethical agents"
+ *   - "AI agent evaluation: did the agent complete the user's intent correctly?"
  *   - "AI agent observability: monitor agent behavior and performance"
+ * Source: ibm.com/think/topics/agentops, ibm.com/think/topics/ai-agent-evaluation
  *
- * Design:
- *   - recordAgentCall()  — called once per specialist dispatch (inside dispatcher)
- *   - recordTurnSummary() — called once per chat turn (inside orchestrator)
- *   - Metrics are structured JSON logs: pipe to Datadog / CloudWatch / Grafana.
- *   - State is reset after each turn summary — the service IS a singleton (Laravel
- *     container binds it as shared), but turnMetrics[] is cleared after summary.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v2 — IBM AgentOps evaluation layer (Gap 3 completion)
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * Extending this:
- *   - Swap Log::info for a dedicated metrics driver (StatsD, Prometheus, etc.)
- *   - Add a DB write to an `agent_metrics` table for historical dashboards.
- *   - Add cost estimation: input_tokens * model_cost + output_tokens * model_cost.
+ * v2 recorded latency, tokens, and cost (telemetry) but had no signal for
+ * whether the agent COMPLETED the user's intent or merely asked a question.
+ *
+ * IBM distinguishes telemetry from evaluation:
+ *   Telemetry  → "how fast / how much did it cost?" (v2 had this)
+ *   Evaluation → "did it actually do what the user asked?" (v3 adds this)
+ *
+ * NEW: recordAgentCall() now accepts an $outcomeSignal parameter:
+ *   'completed'   → agent called a write tool (create, confirm, update, delete)
+ *   'clarifying'  → agent returned a question without calling any write tool
+ *   'partial'     → agent called at least one write tool but also asked questions
+ *   'error'       → agent threw an exception (maps to success: false)
+ *   null          → caller did not provide a signal (backwards-compatible)
+ *
+ * NEW: recordTurnSummary() aggregates and logs outcome distribution per turn,
+ *   enabling dashboard queries like "% of invoice turns that completed vs asked".
+ *
+ * HOW TO POPULATE $outcomeSignal in AgentDispatcherService:
+ *   The Laravel AI SDK exposes the tools called during prompt() via the response
+ *   object or the conversation message row. A simple heuristic suffices:
+ *
+ *   $writeTools = ['create_invoice_draft', 'confirm_invoice', 'update_invoice',
+ *                  'delete_invoice', 'create_client', 'update_client', ...];
+ *   $toolsUsed  = $response->toolsUsed ?? [];  // SDK-provided list
+ *   $didWrite   = !empty(array_intersect($toolsUsed, $writeTools));
+ *   $didAsk     = str_contains((string) $response, '?');
+ *   $outcome    = match(true) {
+ *       $didWrite && !$didAsk => 'completed',
+ *       $didWrite && $didAsk  => 'partial',
+ *       default               => 'clarifying',
+ *   };
+ *
+ * If $response->toolsUsed is not available in your SDK version, pass null and
+ * upgrade the signal once the SDK exposes it — the field is nullable and safe.
  */
 class ObservabilityService
 {
@@ -40,6 +69,12 @@ class ObservabilityService
     ];
 
     /**
+     * Valid outcome signal values.
+     * 'completed' is the only "healthy" state — all others warrant monitoring.
+     */
+    private const OUTCOME_SIGNALS = ['completed', 'clarifying', 'partial', 'error'];
+
+    /**
      * Per-turn metrics buffer — one entry per agent call in the current turn.
      * @var array<int, array>
      */
@@ -50,6 +85,10 @@ class ObservabilityService
      *
      * Call this immediately after prompt() returns (or in the catch block
      * on failure). Pass usage data from the SDK response where available.
+     *
+     * @param  string|null $outcomeSignal  IBM AgentOps evaluation signal (v3):
+     *                                    'completed' | 'clarifying' | 'partial' | 'error' | null
+     *                                    Pass null if not yet available in your SDK version.
      */
     public function recordAgentCall(
         string  $intent,
@@ -61,7 +100,13 @@ class ObservabilityService
         ?int    $outputTokens  = null,
         bool    $success       = true,
         ?string $errorMessage  = null,
+        ?string $outcomeSignal = null,    // v3: IBM AgentOps evaluation layer
     ): void {
+        // Normalise outcome: failed calls are always 'error' regardless of what was passed
+        $outcome = !$success
+            ? 'error'
+            : (in_array($outcomeSignal, self::OUTCOME_SIGNALS, true) ? $outcomeSignal : null);
+
         $estimatedCostUsd = $this->estimateCost($model, $inputTokens, $outputTokens);
 
         $metric = [
@@ -75,6 +120,7 @@ class ObservabilityService
             'total_tokens'       => ($inputTokens ?? 0) + ($outputTokens ?? 0),
             'estimated_cost_usd' => $estimatedCostUsd,
             'success'            => $success,
+            'outcome'            => $outcome,    // v3 evaluation signal
             'error'              => $errorMessage,
             'timestamp'          => now()->toIso8601String(),
         ];
@@ -83,6 +129,17 @@ class ObservabilityService
 
         $logLevel = $success ? 'info' : 'error';
         Log::{$logLevel}('[AgentOps] Agent call recorded', $metric);
+
+        // v3: emit a dedicated evaluation log when the agent clarified instead
+        // of completing — this is the key signal for prompt quality monitoring.
+        if ($outcome === 'clarifying') {
+            Log::warning('[AgentOps] Agent asked a clarifying question instead of completing', [
+                'intent'          => $intent,
+                'user_id'         => $userId,
+                'conversation_id' => $conversationId,
+                'action'          => 'Review agent instructions — ReWOO plan-first workflow may not be triggering lookups.',
+            ]);
+        }
     }
 
     /**
@@ -97,10 +154,18 @@ class ObservabilityService
         array   $intents,
         int     $totalLatencyMs,
     ): void {
-        $totalTokens     = array_sum(array_column($this->turnMetrics, 'total_tokens'));
-        $totalCostUsd    = array_sum(array_column($this->turnMetrics, 'estimated_cost_usd'));
-        $failedAgents    = array_filter($this->turnMetrics, fn ($m): bool => !$m['success']);
-        $agentLatencies  = array_column($this->turnMetrics, 'latency_ms');
+        $totalTokens    = array_sum(array_column($this->turnMetrics, 'total_tokens'));
+        $totalCostUsd   = array_sum(array_column($this->turnMetrics, 'estimated_cost_usd'));
+        $failedAgents   = array_filter($this->turnMetrics, fn ($m): bool => !$m['success']);
+        $agentLatencies = array_column($this->turnMetrics, 'latency_ms');
+
+        // v3: outcome distribution — IBM evaluation layer
+        $outcomes = array_count_values(
+            array_filter(array_column($this->turnMetrics, 'outcome'))
+        );
+        $completionRate = count($this->turnMetrics) > 0
+            ? round(($outcomes['completed'] ?? 0) / count($this->turnMetrics) * 100, 1)
+            : null;
 
         Log::info('[AgentOps] Turn summary', [
             'user_id'             => $userId,
@@ -113,7 +178,10 @@ class ObservabilityService
             'total_cost_usd'      => round($totalCostUsd, 6),
             'failed_agent_count'  => count($failedAgents),
             'all_succeeded'       => count($failedAgents) === 0,
-            'per_agent'           => $this->turnMetrics,
+            // v3 evaluation fields
+            'outcome_distribution' => $outcomes,
+            'completion_rate_pct'  => $completionRate,
+            'per_agent'            => $this->turnMetrics,
         ]);
 
         // Reset buffer — ready for the next turn

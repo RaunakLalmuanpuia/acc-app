@@ -2,86 +2,139 @@
 
 namespace App\Ai\Agents;
 
+use App\Ai\AgentCapability;
 use App\Ai\Tools\Client\CreateClient;
 use App\Ai\Tools\Client\DeleteClient;
-use App\Ai\Tools\Client\GetClientDetails;
 use App\Ai\Tools\Client\GetClients;
 use App\Ai\Tools\Client\UpdateClient;
-use App\Models\User;
 use Laravel\Ai\Attributes\MaxSteps;
 use Laravel\Ai\Attributes\MaxTokens;
 use Laravel\Ai\Attributes\Model;
 use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
-use Laravel\Ai\Concerns\RemembersConversations;
-use Laravel\Ai\Contracts\Agent;
-use Laravel\Ai\Contracts\Conversational;
-use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Enums\Lab;
-use Laravel\Ai\Promptable;
-use Stringable;
 
 /**
- * ClientAgent — Specialist for client / customer management.
+ * ClientAgent  (v3 — extends BaseAgent)
  *
- * Owns: listing, searching, viewing, creating, updating, and deleting clients.
- * Warns the user when a client has unpaid invoices before allowing deletion.
+ * Specialist for client/customer record management.
  *
- * Tools loaded: 5
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THIS FILE IS ALSO A TEMPLATE FOR NEW AGENTS
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * To create a new agent:
+ *   1. Copy this file, rename class and file to YourDomainAgent.
+ *   2. Update getCapabilities() for your domain.
+ *   3. Update writeTools() to list your write tool names.
+ *   4. Write your domainInstructions() — workflow + rules specific to your domain.
+ *   5. Return your tools from tools().
+ *   6. Add #[Model], #[MaxSteps], #[MaxTokens], #[Temperature] attributes.
+ *   7. Add one line to AgentRegistry::AGENTS.
+ *   8. Done — router, HITL, observability, and dispatcher all update automatically.
+ *
+ * DO NOT add IBM standard blocks (plan-first, loop-guard, HITL awareness) to
+ * domainInstructions() — BaseAgent::instructions() injects them automatically
+ * based on your declared capabilities.
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(10)]
+#[MaxSteps(15)]
 #[MaxTokens(2000)]
 #[Temperature(0.1)]
-class ClientAgent implements Agent, Conversational, HasTools
+class ClientAgent extends BaseAgent
 {
-    use Promptable, RemembersConversations;
-
-    public function __construct(public readonly User $user) {}
-
-    public function instructions(): Stringable|string
+    /**
+     * Declare what this agent can do.
+     *
+     * READS        → can call get_clients
+     * WRITES       → can create and update client records
+     * DESTRUCTIVE  → can delete client records (triggers HITL checkpoint)
+     * REFERENCE_ONLY → client names are referenced by InvoiceAgent;
+     *                  mentioning a client name in an invoice request must NOT
+     *                  trigger a standalone ClientAgent dispatch.
+     */
+    public static function getCapabilities(): array
     {
-        $today    = now()->toFormattedDateString();
-        $userName = $this->user->name;
+        return [
+            AgentCapability::READS,
+            AgentCapability::WRITES,
+            AgentCapability::DESTRUCTIVE,
+            AgentCapability::REFERENCE_ONLY,
+        ];
+    }
 
+    /**
+     * The tool names that constitute a write operation for this agent.
+     * Used by AgentDispatcherService to resolve the IBM AgentOps outcome signal.
+     *
+     * @return string[]
+     */
+    public static function writeTools(): array
+    {
+        return ['create_client', 'update_client', 'delete_client'];
+    }
+
+    /**
+     * Client-specific behaviour instructions.
+     *
+     * BaseAgent::instructions() wraps this with:
+     *   - Header (agent identity + today's date)
+     *   - PLAN FIRST / ReWOO block
+     *   - LOOP GUARD block
+     *   - DESTRUCTIVE OPERATIONS / HITL block (because DESTRUCTIVE is declared)
+     *
+     * Write ONLY your domain rules here — do not duplicate the standard blocks.
+     */
+    protected function domainInstructions(): string
+    {
         return <<<PROMPT
-        You are the Client Specialist for {$userName}'s accounting assistant.
-        Today's date is {$today}.
+        ═════════════════════════════════════════════════════════════════════════
+        CLIENT MANAGEMENT — WORKFLOW
+        ═════════════════════════════════════════════════════════════════════════
 
-        You handle everything related to clients: listing, searching, viewing
-        detailed profiles, and creating, updating, or deleting client records.
+        You handle: creating, viewing, updating, and deleting client records.
 
-        ─────────────────────────────────────────────────────────────────────────
-        BEHAVIOUR RULES
-        ─────────────────────────────────────────────────────────────────────────
+        ── CREATING A CLIENT ─────────────────────────────────────────────────
 
-        Listing & Search
-        - Support filtering by name, city, and email.
-        - When showing client details, include outstanding balances if available.
-        - Present lists in a clean table format.
+        1. SEARCH FIRST — Call get_clients with the name the user provided.
+           • Found    → show the existing record. Ask: "A client with this name
+             already exists — do you want to update them instead?"
+           • Not found → proceed to gather missing fields.
 
-        Creating Clients
-        - Ask for all required fields before calling create_client.
-        - Required: name. Optional but encouraged: email, phone, address, GST number.
-        - Confirm the details with the user before creating.
+        2. GATHER GAPS (in one message) — Minimum required fields:
+           • Full name (required)
+           • Email address (required)
+           • Phone number (optional but recommended)
+           • Billing address (optional)
+           • GSTIN (optional — ask only if user mentions GST)
 
-        Updating Clients
-        - Look up the client first using get_clients if you only have a name.
-        - Show the current value and the proposed new value before updating.
-        - Confirm the change explicitly with the user.
+        3. CREATE — Call create_client. Present the new record in a table.
 
-        Deleting Clients
-        - ALWAYS check for unpaid invoices before deleting. Warn the user:
-          "This client has [N] unpaid invoice(s) totalling ₹[amount].
-           Deleting this client may affect those records. Are you sure?"
-        - Only delete after explicit confirmation.
+        ── UPDATING A CLIENT ─────────────────────────────────────────────────
 
-        General
-        - Never expose raw database IDs to the user.
-        - Present outstanding balances in Indian Rupees (₹) with two decimal places.
-        - Use "business" not "company" in all user-facing replies.
-        - If information is missing, ask for it — never guess.
+        1. SEARCH FIRST — Call get_clients to locate the record.
+           If multiple matches, list them and ask which one.
+
+        2. SHOW CURRENT VALUES — Present what will change vs current values.
+
+        3. CONFIRM CHANGE — Ask: "Shall I update [field] from [old] to [new]?"
+
+        4. UPDATE — Call update_client only after explicit yes.
+
+        ── DELETING A CLIENT ─────────────────────────────────────────────────
+
+        The HITL checkpoint (handled upstream) will have intercepted this
+        before this agent is called. When the ✅ HITL PRE-AUTHORIZED block
+        is present, execute delete_client immediately after a get_clients
+        lookup to confirm the correct record ID.
+
+        ── GENERAL ───────────────────────────────────────────────────────────
+
+        • Never expose raw database IDs to the user.
+        • Present client details in a clean table format.
+        • If a GSTIN is provided, display it formatted (e.g. 29ABCDE1234F1Z5).
+        • Never store or display full payment card numbers.
         PROMPT;
     }
 
@@ -89,7 +142,6 @@ class ClientAgent implements Agent, Conversational, HasTools
     {
         return [
             new GetClients($this->user),
-            new GetClientDetails($this->user),
             new CreateClient($this->user),
             new UpdateClient($this->user),
             new DeleteClient($this->user),
