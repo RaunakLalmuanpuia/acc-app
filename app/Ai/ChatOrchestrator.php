@@ -7,6 +7,8 @@ use App\Ai\Services\HitlService;
 use App\Ai\Services\IntentRouterService;
 use App\Ai\Services\ObservabilityService;
 use App\Ai\Services\ResponseMergerService;
+use App\Ai\Services\ScopeGuardService;
+
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -59,6 +61,7 @@ class ChatOrchestrator
         private readonly ResponseMergerService  $merger,
         private readonly HitlService            $hitl,
         private readonly ObservabilityService   $observability,
+        private readonly ScopeGuardService      $scopeGuard,
     ) {}
 
     /**
@@ -82,6 +85,17 @@ class ChatOrchestrator
         array   $attachments = [],
     ): array {
         $turnStart = microtime(true);
+
+        // ── Step 0: Scope guard — zero AI cost, runs before everything ────────
+        $guardResult = $this->scopeGuard->evaluate($message, (string) $user->id);
+
+        if (!$guardResult->allowed) {
+            return [
+                'reply'           => $guardResult->response,
+                'conversation_id' => $conversationId,
+                'hitl_pending'    => false,
+            ];
+        }
 
         Log::info('[ChatOrchestrator] Handling message', [
             'user_id'         => $user->id,
