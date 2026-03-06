@@ -193,11 +193,11 @@ class RouterAgent implements Agent, HasTools
                 'right3'    => '"add Infosys and invoice them ₹5000"  → ["client","invoice"]',
             ],
             'inventory' => [
-                'reference' => 'mentioning a product name inside an invoice request',
-                'wrong'     => '"invoice for 20 Levis Jeans"               → ["invoice","inventory"]',
-                'right1'    => '"invoice for 20 Levis Jeans"               → ["invoice"]',
-                'right2'    => '"add Levis Jeans to inventory at ₹800"     → ["inventory"]',
-                'right3'    => '"add Levis Jeans and invoice for 20"        → ["inventory","invoice"]',
+                'reference' => 'mentioning a product name or quantity inside an invoice request',
+                'wrong'     => '"add 20 units of Samsung TV to invoice"     → ["invoice","inventory"]',
+                'right1'    => '"add 20 units of Samsung TV to invoice"     → ["invoice"]',
+                'right2'    => '"add Samsung TV to inventory at ₹54,999"    → ["inventory"]',
+                'right3'    => '"add Samsung TV to inventory and invoice 5" → ["inventory","invoice"]',
             ],
         ];
 

@@ -9,7 +9,7 @@ use App\Ai\Tools\BankTransaction\ReconcileTransaction;
 use App\Ai\Tools\BankTransaction\UpdateTransactionReviewStatus;
 use App\Ai\Tools\Narration\GetNarrationHeads;
 use App\Ai\Tools\Narration\GetNarrationSubHeads;
-use App\Ai\Tools\Invoice\GetInvoices;
+//use App\Ai\Tools\Invoice\GetInvoices;
 use Laravel\Ai\Attributes\MaxSteps;
 use Laravel\Ai\Attributes\MaxTokens;
 use Laravel\Ai\Attributes\Model;
@@ -212,7 +212,7 @@ class BankTransactionAgent extends BaseAgent
             // Cross-domain lookups (read-only — resolve IDs before writing)
             new GetNarrationHeads($this->user),
             new GetNarrationSubHeads($this->user),
-            new GetInvoices($this->user),
+//            new GetInvoices($this->user),
         ];
     }
 }

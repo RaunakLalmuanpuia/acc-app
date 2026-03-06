@@ -5,6 +5,8 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 use App\Http\Controllers\AiChatController;
+use App\Models\Invoice;
+use Illuminate\Support\Facades\Storage;
 
 Route::get('/', function () {
     return Inertia::render('Welcome', [
@@ -38,5 +40,21 @@ Route::middleware(['auth', 'verified'])->group(function () {
 
     Route::post('/accounting/chat/confirm', [AiChatController::class, 'confirm'])->name('accounting.chat.confirm');
 });
+
+Route::get('/invoices/{invoice}/pdf', function (Invoice $invoice) {
+    $companyId = auth()->user()->companies()->value('id');
+
+    abort_if($invoice->company_id !== (int) $companyId, 403, 'Access denied.');
+    abort_if(! $invoice->pdf_path, 404, 'PDF has not been generated yet.');
+    abort_if(! Storage::disk('local')->exists($invoice->pdf_path), 404, 'PDF file not found. Try regenerating.');
+
+    return Storage::disk('local')->response(
+        $invoice->pdf_path,
+        basename($invoice->pdf_path),
+        ['Content-Type' => 'application/pdf'],
+        'inline', // opens in browser tab, not a forced download
+    );
+})->name('invoices.pdf.download');
+
 
 require __DIR__.'/auth.php';
