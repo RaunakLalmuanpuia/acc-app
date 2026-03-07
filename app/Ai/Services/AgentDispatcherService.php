@@ -261,6 +261,20 @@ class AgentDispatcherService
             return $agent->forUser($user);
         }
 
+        // If this is a DB fallback turn (multiIntent=false but a scoped conversation
+        // exists for this intent), restore the scoped ID so the agent has its history.
+        $scopedId = "{$conversationId}:{$intent}";
+
+        $scopedExists = DB::table('agent_conversation_messages')
+            ->where('conversation_id', $scopedId)
+            ->exists();
+
+        if ($scopedExists) {
+            // Resume the scoped conversation — agent will remember its prior turn
+            return $agent->continue($scopedId, as: $user);
+        }
+
+        // Original logic
         $scopedId = $multiIntent
             ? "{$conversationId}:{$intent}"
             : $conversationId;

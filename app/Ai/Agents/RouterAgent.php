@@ -154,10 +154,8 @@ class RouterAgent implements Agent, HasTools
         $definitions = [
             'invoice'   => 'creating, confirming, viewing, updating, deleting, or generating
                      PDFs for invoices; recording payments; checking overdue invoices.',
-            'client'    => 'EXPLICITLY creating, updating, deleting, or looking up a client
-                     record as the PRIMARY GOAL of the message.',
-            'inventory' => 'EXPLICITLY creating, updating, deleting, or looking up an
-                     inventory item / product / service as the PRIMARY GOAL.',
+            'client'    => 'listing, searching, creating, updating, deleting, or looking up client records as the PRIMARY GOAL of the message.',
+            'inventory' => 'listing, searching, creating, updating, deleting, or looking up inventory items / products / services as the PRIMARY GOAL.',
             'narration' => 'narration heads, sub-heads, transaction categories, ledger heads.',
             'business'  => 'company/business profile, GST number, PAN, bank details, address.',
             'bank_transaction' => 'reviewing, narrating (categorising), flagging, or reconciling

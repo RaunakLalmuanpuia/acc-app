@@ -113,15 +113,15 @@ class ChatOrchestrator
         // Handles follow-up messages like "make it ₹5000 instead" where the
         // router cannot classify without domain context.
         if (empty($intents) && $conversationId !== null) {
-            $lastIntent = $this->getLastIntent($conversationId);
+            $lastIntents = $this->getLastIntents($conversationId); // renamed + returns array
 
-            if ($lastIntent !== null) {
-                Log::info('[ChatOrchestrator] Reusing previous intent from DB', [
+            if (!empty($lastIntents)) {
+                Log::info('[ChatOrchestrator] Reusing previous intents from DB', [
                     'conversation_id' => $conversationId,
-                    'intent'          => $lastIntent,
+                    'intents'         => $lastIntents,
                 ]);
 
-                $intents = [$lastIntent];
+                $intents = $lastIntents;
             }
         }
 
@@ -304,12 +304,63 @@ class ChatOrchestrator
      * Retrieve the last used intent from conversation message metadata.
      * Used as the DB fallback when the RouterAgent returns no valid intents.
      */
-    private function getLastIntent(string $conversationId): ?string
+    /**
+     * Retrieve the last used intents from conversation message metadata.
+     *
+     * For multi-intent turns, returns ALL intents from that turn (identified
+     * by grouping messages within the same second, or by checking multi_intent flag).
+     * Falls back to the single last intent for single-intent turns.
+     *
+     * @return string[]
+     */
+    private function getLastIntents(string $conversationId): array
     {
-        return DB::table('agent_conversation_messages')
-            ->where('conversation_id', $conversationId)
+        $lastMessage = DB::table('agent_conversation_messages')
+            ->where(function ($q) use ($conversationId) {
+                $q->where('conversation_id', $conversationId)
+                    ->orWhere('conversation_id', 'like', $conversationId . ':%');
+            })
+            ->where('role', 'assistant')
             ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
             ->orderByDesc('created_at')
-            ->value(DB::raw("JSON_UNQUOTE(JSON_EXTRACT(meta, '$.intent'))"));
+            ->first();
+
+        if ($lastMessage === null) {
+            return [];
+        }
+
+        $meta = json_decode($lastMessage->meta ?? '{}', true);
+
+        if (empty($meta['multi_intent'])) {
+            $intent = $meta['intent'] ?? null;
+            return $intent ? [$intent] : [];
+        }
+
+        $turnTimestamp = $lastMessage->created_at;
+
+        // ── FIX: select the raw rows, then extract intent in PHP ──────────────
+        $rows = DB::table('agent_conversation_messages')
+            ->where(function ($q) use ($conversationId) {
+                $q->where('conversation_id', $conversationId)
+                    ->orWhere('conversation_id', 'like', $conversationId . ':%');
+            })
+            ->where('role', 'assistant')
+            ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
+            ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true")
+            ->whereBetween('created_at', [
+                date('Y-m-d H:i:s', strtotime($turnTimestamp) - 2),
+                date('Y-m-d H:i:s', strtotime($turnTimestamp) + 2),
+            ])
+            ->select('meta')   // plain column — no DB::raw
+            ->get();
+
+        $intents = $rows
+            ->map(fn ($row) => json_decode($row->meta ?? '{}', true)['intent'] ?? null)
+            ->filter()
+            ->unique()
+            ->values()
+            ->toArray();
+
+        return $intents ?: [];
     }
 }
