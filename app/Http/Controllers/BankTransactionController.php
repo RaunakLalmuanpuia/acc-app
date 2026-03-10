@@ -63,6 +63,8 @@ class BankTransactionController extends Controller
                 ->get();
         }
 
+//        dd($transactions);
+
         return Inertia::render('Banking/PendingReviews', [
             'transactions' => $transactions,
             'heads'        => $heads,
