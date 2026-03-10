@@ -102,7 +102,7 @@ class ReviewNarrationAction
         int $subHeadId,
         ?string $narrationNote
     ): NarrationRule {
-        $matchValue = strtolower(trim(substr($transaction->raw_narration ?? '', 0, 30)));
+        $matchValue = $this->buildMatchValue($transaction);
 
         return NarrationRule::updateOrCreate(
             [
@@ -120,5 +120,30 @@ class ReviewNarrationAction
                 'source'                => 'learned',
             ]
         );
+    }
+
+    /**
+     * Build the best possible match key for a learning rule, in priority order:
+     *
+     * 1. party_name  — most stable; "infosys ltd" fires on any future Infosys
+     *                  transaction regardless of SMS/email/statement format.
+     * 2. bank_reference prefix — useful for recurring standing instructions
+     *                            that have a consistent ref pattern.
+     * 3. raw_narration first 30 chars — last resort, only works when the
+     *                                   narration format is consistent (e.g. CSV imports).
+     *
+     * All values are lowercased and trimmed so matching is case-insensitive.
+     */
+    private function buildMatchValue(BankTransaction $transaction): string
+    {
+        if (!empty($transaction->party_name)) {
+            return strtolower(trim($transaction->party_name));
+        }
+
+        if (!empty($transaction->bank_reference)) {
+            return strtolower(trim(substr($transaction->bank_reference, 0, 20)));
+        }
+
+        return strtolower(trim(substr($transaction->raw_narration ?? '', 0, 30)));
     }
 }
