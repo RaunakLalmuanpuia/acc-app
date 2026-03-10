@@ -13,22 +13,23 @@ class SearchInvoicesTool implements Tool
 
     public function description(): string
     {
-        return 'Search and list invoices for this company. Call with NO parameters to list all invoices. '
-            . 'Optionally filter by: query (invoice number or client name), status, date range, or amount range. '
-            . 'When the user asks to "show all invoices" or "list my invoices" — call this immediately with no arguments.';
+        return 'Search and list invoices for this company. '
+            . 'Call with NO parameters to list all invoices — do not pass status, query, or any other field unless the user explicitly specified it. '
+            . 'When the user says "show all invoices", "list my invoices", or similar — call with zero arguments.';
     }
 
     public function schema(JsonSchema $schema): array
     {
         return [
             'query' => $schema->string()
-                ->description('Invoice number fragment or client name to search for.'),
+                ->description('Invoice number fragment or client name to search for. Omit if the user did not mention a specific client or invoice number.'),
 
             'status' => $schema->string()
                 ->description(
-                    'ONLY include this field if the user\'s message explicitly contains a status word like "draft", "sent", "paid", "cancelled", or "void". ' .
-                    'If the user said "show all invoices", "list invoices", or anything without a status word — DO NOT include this field at all. ' .
-                    'Defaulting to "draft" is WRONG. Omitting this field returns all statuses.'
+                    'ONLY pass this field if the user\'s message contains one of these exact words: "draft", "sent", "paid", "cancelled", "void", or "unpaid". ' .
+                    'Examples that must NOT include status: "show all invoices", "list my invoices", "show me invoices". ' .
+                    'Examples that MUST include status: "show draft invoices" → draft, "show unpaid invoices" → sent, "show paid invoices" → paid. ' .
+                    'When in doubt — OMIT this field. Passing status="draft" for a general list request is a critical error that hides data.'
                 )
                 ->enum(['draft', 'sent', 'paid', 'cancelled', 'void']),
 
@@ -50,7 +51,6 @@ class SearchInvoicesTool implements Tool
             'amount_max' => $schema->number()
                 ->description('Maximum total invoice amount. Omit entirely if not specified — do NOT pass 0.'),
 
-
             'limit' => $schema->integer()
                 ->description('Maximum results to return. Defaults to 15.'),
         ];
@@ -58,26 +58,23 @@ class SearchInvoicesTool implements Tool
 
     public function handle(Request $request): string
     {
-        \Log::debug('[SearchInvoicesTool] raw request', [
-            'query'        => $request['query']        ?? 'NOT SET',
-            'status'       => $request['status']       ?? 'NOT SET',
-            'date_from'    => $request['date_from']    ?? 'NOT SET',
-            'date_to'      => $request['date_to']      ?? 'NOT SET',
-            'amount_min'   => $request['amount_min']   ?? 'NOT SET',
-            'amount_max'   => $request['amount_max']   ?? 'NOT SET',
-            'limit'        => $request['limit']        ?? 'NOT SET',
+        \Log::info('[SearchInvoicesTool] raw request', [
+            'status' => $request['status'] ?? 'NOT SET',
+            'query'  => $request['query']  ?? 'NOT SET',
         ]);
-        try {
-            $service  = new InvoiceAgentService($this->companyId);
-            $query  = strlen($request['query'] ?? '') > 0 ? trim($request['query']) : null;
 
+        try {
+            $service = new InvoiceAgentService($this->companyId);
+
+            $query  = strlen($request['query'] ?? '') > 0 ? trim($request['query']) : null;
             $status = $request['status'] ?? null;
 
-            // If no search query was provided, the user wants ALL invoices — ignore any status the agent assumed
-            if ($query === null) {
+            // Hard guard: if no query and status defaulted to draft,
+            // the agent ignored instructions — clear it to return all invoices.
+            if ($query === null && $status === 'draft') {
                 $status = null;
             }
-            // Treat 0 as null for amounts — 0 is never a meaningful amount filter
+
             $amountMin = isset($request['amount_min']) && (float) $request['amount_min'] > 0
                 ? (float) $request['amount_min']
                 : null;
@@ -87,8 +84,8 @@ class SearchInvoicesTool implements Tool
                 : null;
 
             $invoices = $service->searchInvoices(
-                query:       $request['query']         ?? null,
-                status:      $status        ?? null,
+                query:       $query,
+                status:      $status,
                 dateFrom:    $request['date_from']     ?? null,
                 dateTo:      $request['date_to']       ?? null,
                 dueDateFrom: $request['due_date_from'] ?? null,
@@ -97,8 +94,8 @@ class SearchInvoicesTool implements Tool
                 amountMax:   $amountMax,
                 limit:       isset($request['limit']) ? min((int) $request['limit'], 50) : 15,
             );
+
             if (empty($invoices)) {
-                // Tell the agent exactly what was searched so it can report back honestly
                 return json_encode([
                     'invoices' => [],
                     'count'    => 0,

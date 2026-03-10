@@ -175,7 +175,7 @@ class InvoiceAgentService
 
         $invoices->load('lineItems');
 
-        return $invoices->map(fn(Invoice $i) => $this->formatInvoice($i))->toArray();
+        return $invoices->map(fn (Invoice $i) => $this->formatInvoice($i))->toArray();
     }
 
     // ── Invoice CRUD ──────────────────────────────────────────────────────

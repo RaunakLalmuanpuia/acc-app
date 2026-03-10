@@ -212,6 +212,7 @@ class InvoiceAgent extends BaseAgent
         • Format monetary amounts with currency symbol and 2 decimal places.
         • Never expose raw database IDs. Refer to invoices by invoice_number.
         • Use "client" not "customer" in all user-facing replies.
+
         PROMPT;
     }
 

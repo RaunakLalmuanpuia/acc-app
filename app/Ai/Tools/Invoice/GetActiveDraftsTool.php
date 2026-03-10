@@ -46,42 +46,47 @@ class GetActiveDraftsTool implements Tool
 
     public function handle(Request $request): string
     {
-        $service = new InvoiceAgentService($this->companyId);
+        try {
+            $service = new InvoiceAgentService($this->companyId);
 
-        $invoiceNumber = isset($request['invoice_number']) && trim($request['invoice_number']) !== ''
-            ? trim($request['invoice_number'])
-            : null;
+            $invoiceNumber = isset($request['invoice_number']) && trim($request['invoice_number']) !== ''
+                ? trim($request['invoice_number'])
+                : null;
 
-        $clientName = isset($request['client_name']) && trim($request['client_name']) !== ''
-            ? trim($request['client_name'])
-            : null;
+            $clientName = isset($request['client_name']) && trim($request['client_name']) !== ''
+                ? trim($request['client_name'])
+                : null;
 
-        $drafts = $service->getActiveDrafts(
-            invoiceNumber: $invoiceNumber,
-            clientName:    $clientName,
-        );
+            $drafts = $service->getActiveDrafts(
+                invoiceNumber: $invoiceNumber,
+                clientName:    $clientName,
+            );
 
-        if (empty($drafts)) {
-            $context = $invoiceNumber
-                ? "No draft found with invoice number {$invoiceNumber}."
-                : 'No open drafts found. Safe to create a new invoice.';
+            if (empty($drafts)) {
+                $context = $invoiceNumber
+                    ? "No draft found with invoice number {$invoiceNumber}."
+                    : 'No open drafts found. Safe to create a new invoice.';
 
-            return json_encode(['drafts' => [], 'message' => $context]);
-        }
+                return json_encode(['drafts' => [], 'message' => $context]);
+            }
 
-        // If searching by invoice_number, surface the id prominently
-        if ($invoiceNumber && count($drafts) === 1) {
+            // If searching by invoice_number, surface the id prominently
+            if ($invoiceNumber && count($drafts) === 1) {
+                return json_encode([
+                    'drafts'     => $drafts,
+                    'invoice_id' => $drafts[0]['id'],
+                    'message'    => "Found draft {$invoiceNumber} — invoice_id={$drafts[0]['id']}. Use this id to add line items.",
+                ]);
+            }
+
             return json_encode([
-                'drafts'     => $drafts,
-                'invoice_id' => $drafts[0]['id'],
-                'message'    => "Found draft {$invoiceNumber} — invoice_id={$drafts[0]['id']}. Use this id to add line items.",
+                'drafts'  => $drafts,
+                'count'   => count($drafts),
+                'message' => 'Found open drafts. Use the invoice_id from the relevant draft to continue.',
             ]);
-        }
 
-        return json_encode([
-            'drafts'  => $drafts,
-            'count'   => count($drafts),
-            'message' => 'Found open drafts. Use the invoice_id from the relevant draft to continue.',
-        ]);
+        } catch (\Throwable $e) {
+            return json_encode(['error' => $e->getMessage()]);
+        }
     }
 }
