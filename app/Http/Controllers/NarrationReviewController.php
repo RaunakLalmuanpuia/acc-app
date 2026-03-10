@@ -19,11 +19,15 @@ class NarrationReviewController extends Controller
 
             'correct' => $this->action->correct(
                 transaction:        $transaction,
-                narrationHeadId:    (int) $request->narration_head_id, // Pass the new Head ID
+                narrationHeadId:    (int) $request->narration_head_id,
                 narrationSubHeadId: (int) $request->narration_sub_head_id,
                 narrationNote:      $request->narration_note,
                 partyName:          $request->party_name,
                 saveAsRule:         (bool) $request->input('save_as_rule', false),
+                // Reconciliation fields — all optional
+                invoiceId:          $request->invoice_id   ? (int) $request->invoice_id : null,
+                invoiceNumber:      $request->invoice_number,
+                unreconcile:        (bool) $request->input('unreconcile', false),
             ),
 
             'reject'  => $this->action->reject($transaction),
@@ -31,7 +35,6 @@ class NarrationReviewController extends Controller
             default   => abort(422, 'Invalid action.'),
         };
 
-        // Redirect back so Inertia can seamlessly update the UI
         return back()->with('success', "Transaction {$action}d successfully.");
     }
 }

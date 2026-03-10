@@ -241,7 +241,7 @@ export default function PendingReviews({ auth, transactions, heads, bankAccounts
                                     <div className="relative">
                                         <input
                                             type="file"
-                                            accept=".pdf,.csv,.xls,.xlsx,.png,.jpg,.jpeg"
+                                            accept=".pdf,.csv,.xls,.xlsx"
                                             onChange={(e) => statementForm.setData('statement', e.target.files[0])}
                                             className="w-full bg-gray-50 border border-gray-200 text-gray-800 rounded-lg px-3 py-1.5 text-sm
                                                 file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0
@@ -253,7 +253,7 @@ export default function PendingReviews({ auth, transactions, heads, bankAccounts
                                         <p className="text-red-500 text-xs">{statementForm.errors.statement}</p>
                                     )}
                                     <p className="text-xs text-gray-400">
-                                        Supported: PDF, CSV, XLS, XLSX, PNG, JPG
+                                        Supported: PDF, CSV, XLS, XLSX
                                     </p>
                                     <button
                                         type="submit"
