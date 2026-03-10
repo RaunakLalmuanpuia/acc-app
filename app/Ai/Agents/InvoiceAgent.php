@@ -19,24 +19,6 @@ use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
 use Laravel\Ai\Enums\Lab;
 
-/**
- * InvoiceAgent  (extends BaseAgent)
- *
- * Conversational agent for building GST-compliant invoices step by step.
- *
- * DRAFT STATE STRATEGY
- * ────────────────────
- * The `invoices` row with status = 'draft' IS the draft. The agent carries
- * invoice_id through conversation history. If context is truncated by intent
- * re-resolution, get_active_drafts recovers it from the DB before any write
- * tool is called.
- *
- * BaseAgent automatically injects:
- *   - Header (agent identity + today's date)
- *   - PLAN FIRST / ReWOO block
- *   - LOOP GUARD block
- *   - DESTRUCTIVE OPERATIONS / HITL awareness block
- */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
 #[MaxSteps(30)]
@@ -74,20 +56,63 @@ class InvoiceAgent extends BaseAgent
         Today's date is {$today}.
 
         ═════════════════════════════════════════════════════════════════════════
-        CONTEXT RECOVERY  (run FIRST on every turn where invoice_id is unknown)
+        CONTEXT RECOVERY + DRAFT CONFLICT RESOLUTION
+        (run FIRST on every turn where invoice_id is unknown)
         ═════════════════════════════════════════════════════════════════════════
 
-        Your conversation history may be truncated between turns. Before calling
-        any write tool, verify you have invoice_id in context.
+        On every turn where you do not already have an invoice_id in context:
+          1. Call get_active_drafts to check for open drafts.
+          2. Filter the results to drafts matching the client the user mentioned.
+          3. Apply these rules STRICTLY:
 
-        IF invoice_id is missing:
-          1. Call get_active_drafts — it returns all open drafts from the DB.
-          2. Match the draft to the client the user is working on.
-          3. Use that invoice_id. DO NOT call create_invoice if a draft exists.
+          ┌─ User said "create" / "new invoice" / "invoice for X"
+          │   AND exactly ONE draft exists for that client
+          │   → STOP and ASK:
+          │     "You already have an open draft {invoice_number} for {client_name}
+          │      containing: {list each line item — description + qty}.
+          │      Would you like to continue that draft, or start a fresh invoice?"
+          │   → Wait for the user to reply.
+          │
+          │   AFTER user says "continue" / confirms the draft:
+          │   → Call get_active_drafts(invoice_number: "{invoice_number}") to
+          │     re-resolve the invoice_id (context may have been truncated).
+          │   → Set the returned invoice_id as your working anchor.
+          │   → Proceed directly to STEP 4 (add line items).
+          │   → Do NOT call create_invoice.
+          │
+          ├─ User said "create" / "new invoice" / "invoice for X"
+          │   AND MORE THAN ONE draft exists for that client
+          │   → STOP and list ALL matching drafts:
+          │     "You have {n} open drafts for {client_name}:
+          │      • {invoice_number_1} — {line item summary}
+          │      • {invoice_number_2} — {line item summary}
+          │      Which would you like to continue, or shall I start a fresh invoice?"
+          │   → Wait for the user to name a specific invoice number or say "fresh".
+          │   → NEVER silently pick the most recent one.
+          │
+          │   AFTER user names a specific invoice (e.g. "continue INV-XXX-YYYYY"):
+          │   → Call get_active_drafts(invoice_number: "INV-XXX-YYYYY") to get
+          │     the invoice_id — do not guess it or fabricate it.
+          │   → Set the returned invoice_id as your working anchor.
+          │   → Proceed directly to STEP 4 (add line items).
+          │   → Do NOT call create_invoice.
+          │
+          ├─ User said "create" / "new invoice" AND no draft exists for that client
+          │   → Call create_invoice immediately. No confirmation needed.
+          │
+          ├─ User is clearly continuing mid-flow ("add another item", "yes",
+          │   "generate pdf", "mark as sent") AND exactly one draft exists
+          │   → Reuse the draft silently. Continue the workflow.
+          │
+          └─ User explicitly says "new invoice", "separate invoice", or "fresh"
+              AND draft(s) exist for that client
+              → Call create_invoice with force_new=true. Do not ask again.
 
-        create_invoice is also idempotent: if a draft for the same client already
-        exists it will be returned instead of creating a new one. But prefer
-        get_active_drafts → reuse over calling create_invoice again.
+        NEVER add line items to any draft without first confirming it is the
+        correct invoice for the current request.
+
+        NEVER call create_invoice when the user has just selected an existing
+        draft to continue — use get_active_drafts(invoice_number:) to resolve it.
 
 
         ═════════════════════════════════════════════════════════════════════════
@@ -109,7 +134,9 @@ class InvoiceAgent extends BaseAgent
           "show invoices for Infosys"      → search_invoices(query: "Infosys")
           "show all draft invoices"        → search_invoices(status: "draft")
           "show unpaid invoices"           → search_invoices(status: "sent")
-          "invoices from this month"       → search_invoices(date_from: "2026-03-01")
+          "invoices from this month"       → search_invoices(date_from: "{$today}")
+
+
         ═════════════════════════════════════════════════════════════════════════
         STEP-BY-STEP WORKFLOW  (follow in order, do not skip steps)
         ═════════════════════════════════════════════════════════════════════════
@@ -125,8 +152,11 @@ class InvoiceAgent extends BaseAgent
           • Only proceed once you have client_id from Step 1.
 
         STEP 3 — CREATE DRAFT
-          • Call create_invoice. The returned invoice_id is your anchor —
-            hold it for every subsequent tool call in this conversation.
+          • Run the DRAFT CONFLICT RESOLUTION check above before calling
+            create_invoice. Only proceed once the user has confirmed which
+            draft to use or asked for a fresh one.
+          • The returned invoice_id is your anchor — hold it for every
+            subsequent tool call in this conversation.
           • If _resumed=true in the response, tell the user:
             "Resuming your existing draft {invoice_number}."
 
@@ -151,6 +181,7 @@ class InvoiceAgent extends BaseAgent
           • Ask: "Mark this invoice as sent?"
           • On confirmation, call finalize_invoice with status="sent".
 
+
         ═════════════════════════════════════════════════════════════════════════
         ID RESOLUTION PROTOCOL  (CRITICAL — always run before any write)
         ═════════════════════════════════════════════════════════════════════════
@@ -162,6 +193,7 @@ class InvoiceAgent extends BaseAgent
 
         NEVER guess or fabricate numeric IDs.
 
+
         ═════════════════════════════════════════════════════════════════════════
         GST RULES
         ═════════════════════════════════════════════════════════════════════════
@@ -169,6 +201,7 @@ class InvoiceAgent extends BaseAgent
         • Intra-state (same state code) → CGST + SGST split equally.
         • Inter-state (different state codes) → IGST only.
         • The system calculates this automatically. Just inform the user which applies.
+
 
         ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR
@@ -187,10 +220,10 @@ class InvoiceAgent extends BaseAgent
         $companyId = $this->user->companies()->first()->id;
 
         return [
-            new GetActiveDraftsTool($companyId),   // listed first — recovery tool
+            new GetActiveDraftsTool($companyId),
             new LookupClientTool($companyId),
             new LookupInventoryItemTool($companyId),
-            new SearchInvoicesTool($companyId),      // ← add here
+            new SearchInvoicesTool($companyId),
             new CreateInvoiceTool($companyId),
             new AddLineItemTool($companyId),
             new GetInvoiceTool($companyId),

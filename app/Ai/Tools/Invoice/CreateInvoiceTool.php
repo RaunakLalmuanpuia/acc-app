@@ -45,6 +45,13 @@ class CreateInvoiceTool implements Tool
 
             'terms_and_conditions' => $schema->string()
                 ->description('Optional terms and conditions text.'),
+
+            'force_new' => $schema->boolean()
+                ->description(
+                    'Set true when the user explicitly asked for a new or separate invoice ' .
+                    'and a draft for this client already exists. Bypasses draft resumption ' .
+                    'and always creates a fresh invoice. Default false = resume existing draft.'
+                ),
         ];
     }
 
@@ -56,13 +63,16 @@ class CreateInvoiceTool implements Tool
             $invoice = $service->createDraftInvoice(
                 clientId:           $request['client_id'],
                 invoiceDate:        $request['invoice_date'],
-                dueDate:            $request['due_date']            ?? null,
-                paymentTerms:       $request['payment_terms']       ?? null,
-                notes:              $request['notes']               ?? null,
+                dueDate:            $request['due_date']             ?? null,
+                paymentTerms:       $request['payment_terms']        ?? null,
+                notes:              $request['notes']                ?? null,
                 termsAndConditions: $request['terms_and_conditions'] ?? null,
-                invoiceType:        $request['invoice_type']        ?? 'tax_invoice',
-                currency:           $request['currency']            ?? 'INR',
+                invoiceType:        $request['invoice_type']         ?? 'tax_invoice',
+                currency:           $request['currency']             ?? 'INR',
+                forceNew:           (bool) ($request['force_new']    ?? false),  // ← was missing
             );
+
+            $resumed = $invoice['_resumed'] ?? false;
 
             return json_encode([
                 'success'        => true,
@@ -71,7 +81,10 @@ class CreateInvoiceTool implements Tool
                 'supply_type'    => $invoice['supply_type'],
                 'status'         => $invoice['status'],
                 'company_name'   => $invoice['company_name'] ?? null,
-                'message'        => "Draft invoice {$invoice['invoice_number']} created. invoice_id={$invoice['id']}. Now add line items using AddLineItem.",
+                '_resumed'       => $resumed,
+                'message'        => $resumed
+                    ? "Resumed existing draft {$invoice['invoice_number']} (invoice_id={$invoice['id']})."
+                    : "Draft invoice {$invoice['invoice_number']} created. invoice_id={$invoice['id']}. Now add line items using AddLineItem.",
             ]);
         } catch (\Throwable $e) {
             return json_encode(['error' => $e->getMessage()]);

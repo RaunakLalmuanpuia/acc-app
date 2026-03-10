@@ -79,7 +79,7 @@ class InvoiceAgentService
                 );
 
                 if (empty($tokens)) {
-                    $q->whereRaw('1 = 0'); // no valid tokens → return nothing
+                    $q->whereRaw('1 = 0');
                     return;
                 }
 
@@ -109,9 +109,9 @@ class InvoiceAgentService
     }
 
     // ── Invoice ─────────────────────────────────────────────────────────
+
     /**
      * Search invoices by invoice number, client name, status, date range, or amount.
-     * Used by the agent to find invoices without knowing the exact invoice_id.
      */
     public function searchInvoices(
         ?string $query = null,
@@ -145,7 +145,6 @@ class InvoiceAgentService
             ->when($amountMin !== null, fn($q) => $q->where('total_amount', '>=', $amountMin))
             ->when($amountMax !== null, fn($q) => $q->where('total_amount', '<=', $amountMax))
             ->when(
-            // Condition closure — only fires if we have valid tokens
                 function () use ($query) {
                     if ($query === null) return false;
                     $tokens = array_filter(
@@ -154,7 +153,6 @@ class InvoiceAgentService
                     );
                     return !empty($tokens);
                 },
-                // Query closure — only runs if condition returned true
                 function ($q) use ($query) {
                     $tokens = array_filter(
                         preg_split('/[\s\-_]+/', strtolower(preg_replace("/[\'\"]/", '', $query))),
@@ -175,22 +173,6 @@ class InvoiceAgentService
             ->limit($limit)
             ->get();
 
-
-        \Log::debug('[searchInvoices] sql', [
-            'sql'      => Invoice::query()
-                ->where('company_id', $this->companyId)
-                ->orderByDesc('invoice_date')
-                ->limit($limit)
-                ->toSql(),
-            'count'    => $invoices->count(),
-            'bindings' => Invoice::query()
-                ->where('company_id', $this->companyId)
-                ->orderByDesc('invoice_date')
-                ->limit($limit)
-                ->getBindings(),
-        ]);
-
-        // Load line items separately — avoids the with()+limit() Eloquent conflict
         $invoices->load('lineItems');
 
         return $invoices->map(fn(Invoice $i) => $this->formatInvoice($i))->toArray();
@@ -199,13 +181,17 @@ class InvoiceAgentService
     // ── Invoice CRUD ──────────────────────────────────────────────────────
 
     /**
-     * Return all open drafts for this company.
-     * The agent calls this to recover invoice_id when conversation context is lost.
+     * Return open drafts for this company.
+     * Optionally filter by exact invoice_number or client_name fragment.
      */
-    public function getActiveDrafts(): array
-    {
+    public function getActiveDrafts(
+        ?string $invoiceNumber = null,
+        ?string $clientName = null,
+    ): array {
         return Invoice::where('company_id', $this->companyId)
             ->where('status', 'draft')
+            ->when($invoiceNumber, fn($q) => $q->where('invoice_number', $invoiceNumber))
+            ->when($clientName,    fn($q) => $q->where('client_name', 'like', "%{$clientName}%"))
             ->with('lineItems')
             ->latest()
             ->get()
@@ -216,10 +202,9 @@ class InvoiceAgentService
     /**
      * Create a new draft invoice snapshotting company + client details.
      *
-     * IDEMPOTENCY GUARD: If a draft already exists for this client, return it
-     * instead of creating a duplicate. This handles the case where the agent
-     * loses invoice_id from context (intent re-resolution truncates history)
-     * and mistakenly calls create_invoice a second time.
+     * IDEMPOTENCY: If $forceNew is false and a draft already exists for this
+     * client, return it instead of creating a duplicate.
+     * If $forceNew is true, always create a fresh invoice regardless.
      */
     public function createDraftInvoice(
         int     $clientId,
@@ -230,24 +215,28 @@ class InvoiceAgentService
         ?string $termsAndConditions = null,
         string  $invoiceType = 'tax_invoice',
         string  $currency = 'INR',
+        bool    $forceNew = false,          // ← true = always create fresh
     ): array {
+        // ── Idempotency guard (skipped when forceNew) ─────────────────────
+        if (!$forceNew) {
+            $existing = Invoice::where('company_id', $this->companyId)
+                ->where('client_id', $clientId)
+                ->where('status', 'draft')
+                ->with('lineItems')
+                ->latest()
+                ->first();
+
+            if ($existing) {
+                return array_merge($this->formatInvoice($existing), [
+                    '_resumed' => true,
+                    '_message' => "Resumed existing draft {$existing->invoice_number} (id={$existing->id}) — no duplicate created.",
+                ]);
+            }
+        }
+
+        // ── Create fresh invoice ──────────────────────────────────────────
         $company = \App\Models\Company::findOrFail($this->companyId);
         $client  = Client::where('company_id', $this->companyId)->findOrFail($clientId);
-
-        // Return existing draft rather than creating a duplicate
-        $existing = Invoice::where('company_id', $this->companyId)
-            ->where('client_id', $clientId)
-            ->where('status', 'draft')
-            ->with('lineItems')
-            ->latest()
-            ->first();
-
-        if ($existing) {
-            return array_merge($this->formatInvoice($existing), [
-                '_resumed' => true,
-                '_message' => "Resumed existing draft {$existing->invoice_number} (id={$existing->id}) — no duplicate created.",
-            ]);
-        }
 
         $invoice = Invoice::create([
             'invoice_number' => Invoice::generateNumber(),
@@ -280,7 +269,7 @@ class InvoiceAgentService
 
         $invoice->update(['supply_type' => $invoice->determineSupplyType()]);
 
-        return $this->formatInvoice($invoice);
+        return $this->formatInvoice($invoice->fresh());
     }
 
     /**
@@ -361,12 +350,12 @@ class InvoiceAgentService
      */
     public function finalizeInvoice(int $invoiceId, string $status = 'sent'): array
     {
+        $invoice = $this->findDraftInvoice($invoiceId);
+
         $allowed = ['sent', 'cancelled', 'void'];
         if (! in_array($status, $allowed, true)) {
             throw new \InvalidArgumentException("Status must be one of: " . implode(', ', $allowed));
         }
-
-        $invoice = $this->findDraftInvoice($invoiceId);
 
         if (! $invoice->pdf_path) {
             throw new \RuntimeException("Generate the PDF before finalizing the invoice.");
@@ -389,6 +378,12 @@ class InvoiceAgentService
             ->with('lineItems')
             ->findOrFail($invoiceId);
 
+        if ($invoice->status !== 'draft') {
+            throw new \RuntimeException(
+                "Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be modified."
+            );
+        }
+
         $pdf  = Pdf::loadView('invoices.pdf', ['invoice' => $invoice])
             ->setPaper('a4', 'portrait');
 
@@ -397,7 +392,6 @@ class InvoiceAgentService
 
         $invoice->update(['pdf_path' => $path]);
 
-        // Generate a temporary signed URL (valid 60 min) for the chat UI
         $downloadUrl = route('invoices.pdf.download', [
             'invoice' => $invoice->id,
         ]);
