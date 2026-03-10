@@ -5,8 +5,15 @@ use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 use App\Http\Controllers\AiChatController;
+use App\Http\Controllers\BankTransactionController;
+use App\Http\Controllers\NarrationReviewController;
+use App\Http\Controllers\SmsIngestController;
+use App\Http\Controllers\EmailIngestController;
+use App\Http\Controllers\StatementUploadController;
+
 use App\Models\Invoice;
 use Illuminate\Support\Facades\Storage;
+
 
 Route::get('/', function () {
     return Inertia::render('Welcome', [
@@ -55,6 +62,33 @@ Route::get('/invoices/{invoice}/pdf', function (Invoice $invoice) {
         'inline', // opens in browser tab, not a forced download
     );
 })->name('invoices.pdf.download');
+
+
+
+Route::middleware(['auth', 'verified'])->prefix('banking')->group(function () {
+
+    // Display pending transactions view
+    Route::get('/transactions/pending', [BankTransactionController::class, 'pending'])
+        ->name('banking.transactions.pending');
+
+    // Handle narration review (Inertia will submit to this)
+    Route::post('/transactions/{transaction}/review/{action}', [NarrationReviewController::class, 'handle'])
+        ->where('action', 'approve|correct|reject')
+        ->name('banking.transactions.review');
+
+    // SMS Ingest
+    Route::post('/transactions/sms', SmsIngestController::class)
+        ->name('banking.transactions.sms.ingest');
+
+    // Email Ingest
+    Route::post('/transactions/email', EmailIngestController::class)
+        ->name('banking.transactions.email.ingest');
+
+    // Statement Upload
+    Route::post('/transactions/statement', StatementUploadController::class)
+        ->name('banking.transactions.statement.upload');
+});
+
 
 
 require __DIR__.'/auth.php';
