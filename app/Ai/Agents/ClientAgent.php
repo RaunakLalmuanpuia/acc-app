@@ -102,14 +102,22 @@ class ClientAgent extends BaseAgent
              already exists — do you want to update them instead?"
            • Not found → proceed to gather missing fields.
 
-        2. GATHER GAPS (in one message) — Minimum required fields:
-           • Full name (required)
-           • Email address (required)
-           • Phone number (optional but recommended)
-           • Billing address (optional)
-           • GSTIN (optional — ask only if user mentions GST)
+        2. GATHER GAPS — Required to create (minimum viable):
+           • Full name      (required)
+           • Email address  (required)
 
-        3. CREATE — Call create_client. Present the new record in a table.
+           Optional fields: phone, billing address, GSTIN, PAN, GST type,
+           city, state, state code, pincode, country, currency, payment terms,
+           credit limit, notes.
+
+           RULE: Once you have name + email, you have enough to create.
+           Collect any optional fields the user HAS already provided.
+           Do NOT ask for optional fields that are missing — create immediately
+           and inform the user they can be updated later.
+
+        3. CREATE — Call create_client with name, email, and any optionals
+           already provided. After creating, present the record in a table and
+           add ONE line: "Phone, GSTIN, and address can be updated anytime."
 
         ── UPDATING A CLIENT ─────────────────────────────────────────────────
 
@@ -135,6 +143,8 @@ class ClientAgent extends BaseAgent
         • Present client details in a clean table format.
         • If a GSTIN is provided, display it formatted (e.g. 29ABCDE1234F1Z5).
         • Never store or display full payment card numbers.
+
+        • If the conversation history shows the client was already created and the current message is unrelated to client management, reply with nothing.
         PROMPT;
     }
 

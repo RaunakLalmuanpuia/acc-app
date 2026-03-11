@@ -63,24 +63,28 @@ class IntentRouterService
      * @param  string   $message  The raw user message.
      * @return string[]           e.g. ['invoice'], ['client', 'invoice'], []
      */
-    public function resolve(string $message): array
+    public function resolve(string $message, ?string $conversationId): array
     {
-        $raw     = $this->callRouter($message);
-        $intents = $this->parseIntents($raw);
-        $valid   = $this->filterValid($intents);
+        $routerIntents = $this->callRouter($message);
 
-        // Short messages with no domain noun anchor are likely follow-ups
-        // mid-conversation. Return [] so the orchestrator's DB fallback
-        // recovers the correct intent from history instead of misrouting.
-        if (!empty($valid) && $this->looksLikeFollowUp($message)) {
+        // Strip 'unknown' — it is not a real intent, treat as empty
+        $routerIntents = array_filter($routerIntents, fn($i) => $i !== 'unknown');
+        $routerIntents = array_values($routerIntents);
+
+        if (!empty($routerIntents)) {
+            Log::info('[IntentRouterService] Router confident', ['intents' => $routerIntents]);
+            return $routerIntents;
+        }
+
+        // Router returned nothing real — check follow-up patterns
+        if ($this->looksLikeFollowUp($message)) {
             Log::info('[IntentRouterService] Follow-up detected, deferring to DB fallback', [
-                'message'        => $message,
-                'router_intents' => $valid,
+                'message' => mb_substr($message, 0, 80),
             ]);
             return [];
         }
 
-        return $valid;
+        return [];
     }
 
     private function looksLikeFollowUp(string $message): bool
@@ -136,18 +140,19 @@ class IntentRouterService
      * (getLastIntent) can attempt recovery — or fall through to the zero-cost
      * unknownResponse() static reply.
      */
-    private function callRouter(string $message): string
+    private function callRouter(string $message): array
     {
         try {
             $response = $this->router->prompt(prompt: $message);
-            return trim((string) $response);
+            $decoded = json_decode(trim((string) $response), true);
+            return $decoded['intents'] ?? [];
         } catch (\Throwable $e) {
             Log::error('[IntentRouterService] RouterAgent call failed', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
 
-            return json_encode(['intents' => ['unknown']]);
+            return [];
         }
     }
 

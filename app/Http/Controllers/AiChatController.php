@@ -88,6 +88,7 @@ class AiChatController extends Controller
      */
     public function send(Request $request): RedirectResponse
     {
+        set_time_limit(120);
         $request->validate([
             'message'         => ['required', 'string', 'max:4000'],
             'conversation_id' => ['nullable', 'string', 'uuid'],

@@ -52,11 +52,41 @@ class InvoiceAgent extends BaseAgent
             return "Please set up your business profile first before managing invoices.";
         }
         $today   = now()->toDateString();
+        $dueDate = now()->addDays(30)->toDateString();
 
         return <<<PROMPT
         You create GST-compliant invoices for {$company->company_name}
         (State: {$company->state}, Code: {$company->state_code}, GST: {$company->gst_number}).
         Today's date is {$today}.
+
+        ═════════════════════════════════════════════════════════════════════════
+        BLACKBOARD DEPENDENCY CHECK  (run FIRST — before any other step)
+        ═════════════════════════════════════════════════════════════════════════
+            Before doing anything, check whether a prior agent context block exists
+            at the top of this prompt.
+
+            If a prior agent context block is present AND it contains a clarifying
+            question (i.e. the client/inventory agent asked the user for more info):
+
+              → The resource (client, inventory item) does NOT exist yet.
+              → Do NOT call lookup_client, lookup_inventory_item, or any other tool.
+              → Do NOT repeat the other agent's question.
+              → Respond with ONLY this single sentence:
+                "Once the [client/inventory] details above are confirmed,
+                 I'll proceed with creating the invoice."
+              → Stop. Do not continue to any other workflow step.
+
+            Only proceed to the steps below if EITHER:
+              (a) No prior agent context block is present, OR
+              (b) The prior agent context confirms the resource was successfully
+                  created (e.g. "Client TechNova Solutions created successfully").
+
+        When prior agent context confirms BOTH client and inventory were created:
+          → Skip lookup_client — use the client name directly from blackboard context.
+          → Skip lookup_inventory_item — use the item name and rate from blackboard context.
+          → Call create_invoice immediately with client name.
+          → Call add_line_item immediately with item details from blackboard.
+          → Maximum 3 tool calls for this turn: create_invoice + add_line_item + get_invoice.
 
         ═════════════════════════════════════════════════════════════════════════
         CONTEXT RECOVERY + DRAFT CONFLICT RESOLUTION
@@ -116,6 +146,10 @@ class InvoiceAgent extends BaseAgent
 
         NEVER call create_invoice when the user has just selected an existing
         draft to continue — use get_active_drafts(invoice_number:) to resolve it.
+        CONTEXT RECOVERY (run when invoice_id is not in your immediate context):
+          → Call get_active_drafts(client: "TechNova Solutions") to re-anchor.
+          → Never say "invoice ID might not be correct" — always try get_active_drafts first.
+          → Only report an error if get_active_drafts also returns nothing.
 
 
         ═════════════════════════════════════════════════════════════════════════
@@ -153,6 +187,8 @@ class InvoiceAgent extends BaseAgent
           • Ask for: invoice date (default today), due date or payment terms,
             invoice type (default: tax_invoice), optional notes/terms.
           • Only proceed once you have client_id from Step 1.
+          - Due date: default {$dueDate}. Always pass as YYYY-MM-DD.
+            Never pass "Net 30" or any text string as due_date.
 
         STEP 3 — CREATE DRAFT
           • Run the DRAFT CONFLICT RESOLUTION check above before calling
@@ -195,6 +231,15 @@ class InvoiceAgent extends BaseAgent
           • inventory_item_id — from lookup_inventory_item, or omit for manual lines.
 
         NEVER guess or fabricate numeric IDs.
+
+        INVOICE_ID RECOVERY (run before generate_invoice_pdf or finalize_invoice
+        if invoice_id is not confirmed in your immediate context):
+
+          → Call get_active_drafts — it returns the real invoice_id for each draft.
+          → NEVER extract invoice_id from the invoice_number string
+            (e.g. do NOT use 78864 from INV-20260311-78864 — these are different).
+          → Only pass invoice_id values returned directly by create_invoice
+            or get_active_drafts tool responses.
 
 
         ═════════════════════════════════════════════════════════════════════════

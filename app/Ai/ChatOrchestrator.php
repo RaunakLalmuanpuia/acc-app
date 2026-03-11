@@ -104,7 +104,7 @@ class ChatOrchestrator
         ]);
 
         // ── Step 1: Route ──────────────────────────────────────────────────────
-        $intents = $this->router->resolve($message);
+        $intents = $this->router->resolve($message, $conversationId);
 
         Log::info('[ChatOrchestrator] Resolved intents', ['intents' => $intents]);
 
@@ -321,55 +321,71 @@ class ChatOrchestrator
      */
     private function getLastIntents(string $conversationId): array
     {
-        $lastMessage = DB::table('agent_conversation_messages')
-            ->where(function ($q) use ($conversationId) {
-                $q->where('conversation_id', $conversationId)
-                    ->orWhere('conversation_id', 'like', $conversationId . ':%');
-            })
+        $scope = function ($q) use ($conversationId) {
+            $q->where('conversation_id', $conversationId)
+                ->orWhere('conversation_id', 'like', $conversationId . ':%');
+        };
+
+        // ── Try multi-intent first ─────────────────────────────────────────────
+        $lastMulti = DB::table('agent_conversation_messages')
+            ->where($scope)
+            ->where('role', 'assistant')
+            ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true")
+            ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
+            ->orderByDesc('created_at')
+            ->first();
+
+        if ($lastMulti !== null) {
+            $meta   = json_decode($lastMulti->meta ?? '{}', true);
+            $turnId = $meta['turn_id'] ?? null;
+
+            $query = DB::table('agent_conversation_messages')
+                ->where($scope)
+                ->where('role', 'assistant')
+                ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true");
+
+            if ($turnId !== null) {
+                $query->whereRaw("JSON_EXTRACT(meta, '$.turn_id') = ?", [$turnId]);
+            } else {
+                $ts = $lastMulti->created_at;
+                $query->whereBetween('created_at', [
+                    date('Y-m-d H:i:s', strtotime($ts) - 2),
+                    date('Y-m-d H:i:s', strtotime($ts) + 2),
+                ]);
+            }
+
+            $intents = $query
+                ->select('meta')
+                ->get()
+                ->map(fn ($row) => json_decode($row->meta ?? '{}', true)['intent'] ?? null)
+                ->filter()
+                ->unique()
+                ->values()
+                ->toArray();
+
+            if (!empty($intents)) {
+                Log::info('[ChatOrchestrator] Reusing previous multi-intent group from DB', [
+                    'conversation_id' => $conversationId,
+                    'turn_id'         => $turnId,
+                    'intents'         => $intents,
+                ]);
+                return $intents;
+            }
+        }
+
+        // ── Fall back to most recent single-intent row ─────────────────────────
+        $lastSingle = DB::table('agent_conversation_messages')
+            ->where($scope)
             ->where('role', 'assistant')
             ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
             ->orderByDesc('created_at')
             ->first();
 
-        if ($lastMessage === null) return [];
+        if ($lastSingle === null) return [];
 
-        $meta   = json_decode($lastMessage->meta ?? '{}', true);
+        $meta   = json_decode($lastSingle->meta ?? '{}', true);
         $intent = $meta['intent'] ?? null;
 
-        if (empty($meta['multi_intent'])) {
-            return $intent ? [$intent] : [];
-        }
-
-        // Multi-intent: group by turn_id (reliable) with timestamp as fallback
-        $turnId = $meta['turn_id'] ?? null;
-
-        $query = DB::table('agent_conversation_messages')
-            ->where(function ($q) use ($conversationId) {
-                $q->where('conversation_id', $conversationId)
-                    ->orWhere('conversation_id', 'like', $conversationId . ':%');
-            })
-            ->where('role', 'assistant')
-            ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true");
-
-        if ($turnId !== null) {
-            // Precise grouping via turn_id
-            $query->whereRaw("JSON_EXTRACT(meta, '$.turn_id') = ?", [$turnId]);
-        } else {
-            // Legacy fallback for rows written before turn_id was added
-            $ts = $lastMessage->created_at;
-            $query->whereBetween('created_at', [
-                date('Y-m-d H:i:s', strtotime($ts) - 2),
-                date('Y-m-d H:i:s', strtotime($ts) + 2),
-            ]);
-        }
-
-        return $query
-            ->select('meta')
-            ->get()
-            ->map(fn ($row) => json_decode($row->meta ?? '{}', true)['intent'] ?? null)
-            ->filter()
-            ->unique()
-            ->values()
-            ->toArray();
+        return $intent ? [$intent] : [];
     }
 }
