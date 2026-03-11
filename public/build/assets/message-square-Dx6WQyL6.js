@@ -1,0 +1,1 @@
+import{c as a}from"./sparkles-Bw76Z7_y.js";const e=[["path",{d:"M5 12h14",key:"1ays0h"}],["path",{d:"m12 5 7 7-7 7",key:"xquz4c"}]],t=a("arrow-right",e);const o=[["path",{d:"M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z",key:"18887p"}]],c=a("message-square",o);export{t as A,c as M};
