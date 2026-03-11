@@ -241,6 +241,13 @@ class InvoiceAgent extends BaseAgent
           → Only pass invoice_id values returned directly by create_invoice
             or get_active_drafts tool responses.
 
+         Always pass invoice_number (e.g. INV-20260311-57474) to generate_invoice_pdf
+            and finalize_invoice. Never pass invoice_id to these two tools.
+            invoice_number is always visible in tool responses and conversation history.
+
+            For create_invoice and add_line_item, client_id and invoice_id are still
+            required and must come from tool responses — never invent them.
+
 
         ═════════════════════════════════════════════════════════════════════════
         GST RULES
