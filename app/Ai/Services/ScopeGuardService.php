@@ -74,7 +74,7 @@ class ScopeGuardService
         '/\b(draw|illustrate|design) (me |us )?(a |an )?\b/i',
 
         // Coding / technical assistance
-        '/\b(write|generate|create|give me) (a |an |some )?(code|script|function|class|program|algorithm|snippet|regex)\b/i',
+        '/\b(write|generate|create|give me)(\s+\w+){0,4}\s*(code|script|function|class|program|algorithm|snippet|regex)\b/i',
         '/\b(debug|fix|refactor|optimise|optimize) (my |this |the )?(code|script|function|class|bug)\b/i',
         '/\bhow (do i|to) (install|configure|set up|deploy|run)\b/i',
 
@@ -101,6 +101,14 @@ class ScopeGuardService
 
         // Explicit content
         '/\b(sex|porn|nude|naked|explicit|adult content|18\+|nsfw)\b/i',
+
+        // General Knowledge
+        '/\bwhat (is|are|was|were) the (capital|population|currency|language|flag|president|prime minister|largest|smallest|tallest|oldest|richest) of\b/i',
+        '/\bwho (invented|discovered|painted|wrote|composed|founded|built|won) (the |a |an )?\b/i',
+        '/\bwhen (was|were|did) .{3,40} (born|die|invented|discovered|founded|built|won)\b/i',
+        '/\b(what|where) (is|are) (the )?(weather|temperature|forecast)\b/i',
+        '/\btell me (a )?joke\b/i',
+        '/\b(recommend|suggest) (a |an )?(movie|book|song|restaurant|hotel|place)\b/i',
     ];
 
     /**

@@ -159,13 +159,15 @@ class ObservabilityService
         $failedAgents   = array_filter($this->turnMetrics, fn ($m): bool => !$m['success']);
         $agentLatencies = array_column($this->turnMetrics, 'latency_ms');
 
-        // v3: outcome distribution — IBM evaluation layer
-        $outcomes = array_count_values(
-            array_filter(array_column($this->turnMetrics, 'outcome'))
-        );
-        $completionRate = count($this->turnMetrics) > 0
-            ? round(($outcomes['completed'] ?? 0) / count($this->turnMetrics) * 100, 1)
-            : null;
+        $outcomesRaw = array_column($this->turnMetrics, 'outcome');
+        $hasAnySignal = count(array_filter($outcomesRaw, fn($o) => $o !== null)) > 0;
+
+        $outcomes = array_count_values(array_filter($outcomesRaw));
+        $completionRate = (!$hasAnySignal)
+            ? null   // ← SDK doesn't expose toolsUsed yet, don't report 0%
+            : (count($this->turnMetrics) > 0
+                ? round(($outcomes['completed'] ?? 0) / count($this->turnMetrics) * 100, 1)
+                : null);
 
         Log::info('[AgentOps] Turn summary', [
             'user_id'             => $userId,

@@ -63,19 +63,14 @@ class RouterAgent implements Agent, HasTools
      * Valid domain intents the router may emit.
      * Derived from AgentRegistry — keep this in sync.
      */
-    public const INTENTS = [
-        'invoice',
-        'client',
-        'inventory',
-        'narration',
-        'business',
-        'bank_transaction',
-        'unknown',
-    ];
+    public static function getIntents(): array
+    {
+        return [...AgentRegistry::validIntents(), 'unknown'];
+    }
 
     public function instructions(): Stringable|string
     {
-        $intents          = implode(' | ', self::INTENTS);
+        $intents          = implode(' | ', self::getIntents());
         $domainDefs       = $this->buildDomainDefinitions();
         $suppressionRules = $this->buildSuppressionRules();
 

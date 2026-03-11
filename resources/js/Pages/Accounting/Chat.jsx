@@ -220,7 +220,7 @@ export default function Chat() {
 
         router.post(
             route('accounting.chat.confirm'),
-            { pending_id: pendingId, attachments },
+            { pending_id: pendingId,conversation_id: data.conversation_id, attachments },
             {
                 preserveScroll: true,
                 preserveState:  true,
@@ -238,8 +238,18 @@ export default function Chat() {
     };
 
     // ── Cancel HITL checkpoint — client-only, no backend call needed ───────
+    // In handleHitlCancel:
     const handleHitlCancel = () => {
         setHitlState({ active: false, pendingId: null });
+
+        // Mark the HITL message as cancelled so it stops rendering as a card
+        // AND doesn't fall through to the standard bubble renderer
+        setLocalMessages(prev => prev.map(msg =>
+            msg.isHitl && msg.pendingId === hitlState.pendingId
+                ? { ...msg, cancelled: true }
+                : msg
+        ));
+
         setLocalMessages(prev => [...prev, {
             id:      Date.now(),
             role:    'assistant',
@@ -350,6 +360,9 @@ export default function Chat() {
                                 </div>
 
                                 {localMessages.map((msg) => {
+                                    // Suppress cancelled HITL warning bubbles entirely
+                                    if (msg.isHitl && msg.cancelled) return null;
+
                                     // Active HITL message → render confirm card
                                     if (msg.isHitl && hitlState.active && msg.pendingId === hitlState.pendingId) {
                                         return (

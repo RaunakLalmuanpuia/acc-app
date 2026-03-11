@@ -22,11 +22,12 @@ class ResponseMergerService
      */
     private const UNKNOWN_RESPONSE =
         "I'm your accounting assistant. I can help you with:\n\n"
-        . "• **Invoices** — create, confirm, view, or generate PDFs\n"
-        . "• **Clients** — add, update, or look up client records\n"
-        . "• **Inventory** — manage products and services\n"
-        . "• **Narration Heads** — set up transaction categories\n"
-        . "• **Business Profile** — view or update your business details\n\n"
+        . "• 🧾 **Invoices** — create, confirm, view, or generate PDFs\n"
+        . "• 👤 **Clients** — add, update, or look up client records\n"
+        . "• 📦 **Inventory** — manage products and services\n"
+        . "• 📒 **Narration Heads** — set up transaction categories\n"
+        . "• 🏢 **Business Profile** — view or update your business details\n"
+        . "• 🏦 **Bank Transactions** — review, categorise, reconcile transactions\n\n"
         . "How can I help you today?";
 
     /** Emoji labels per domain for multi-intent merged replies. */
@@ -36,6 +37,7 @@ class ResponseMergerService
         'inventory' => '📦 Inventory',
         'narration' => '📒 Narration Heads',
         'business'  => '🏢 Business Profile',
+        'bank_transaction' => '🏦 Bank Transactions',
     ];
 
     /**

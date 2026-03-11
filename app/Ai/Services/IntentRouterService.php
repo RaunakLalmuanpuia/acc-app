@@ -67,8 +67,64 @@ class IntentRouterService
     {
         $raw     = $this->callRouter($message);
         $intents = $this->parseIntents($raw);
+        $valid   = $this->filterValid($intents);
 
-        return $this->filterValid($intents);
+        // Short messages with no domain noun anchor are likely follow-ups
+        // mid-conversation. Return [] so the orchestrator's DB fallback
+        // recovers the correct intent from history instead of misrouting.
+        if (!empty($valid) && $this->looksLikeFollowUp($message)) {
+            Log::info('[IntentRouterService] Follow-up detected, deferring to DB fallback', [
+                'message'        => $message,
+                'router_intents' => $valid,
+            ]);
+            return [];
+        }
+
+        return $valid;
+    }
+
+    private function looksLikeFollowUp(string $message): bool
+    {
+        $wordCount = str_word_count(strtolower($message));
+
+        $hasAccountingNoun = preg_match(
+            '/\b(invoice|invoices|client|clients|inventory|product|
+        narration|business|bank|transaction|transactions|
+        head|sub.?head)\b/ix',
+            $message
+        );
+
+        // Existing check: short message with no domain noun
+        if ($wordCount <= 8 && !$hasAccountingNoun) {
+            return true;
+        }
+
+        // NEW: detect answer-pattern messages — "X is Y, A is B, C code D"
+        // These are responses to clarifying questions, not new intent requests.
+        // They contain field:value pairs but no action verb at the start.
+        $hasActionVerb = preg_match(
+            '/^\s*(create|make|generate|show|list|view|find|search|
+        add|update|edit|delete|remove|void|cancel|send|
+        fetch|get|give|issue|record)\b/ix',
+            $message
+        );
+
+        $hasFieldValuePattern = preg_match(
+            '/\b(is|are|code|number|type|rate|terms?|limit|notes?|
+        stock|unit|hsn|sac|pincode|country|city|state|
+        currency|phone|email|address|payment|gst|pan)\b.{0,20}
+        [\d₹@+\/\-]/ix',
+            $message
+        );
+
+        if (!$hasActionVerb && $hasFieldValuePattern) {
+            Log::info('[IntentRouterService] Answer-pattern follow-up detected, deferring to DB fallback', [
+                'message' => mb_substr($message, 0, 80),
+            ]);
+            return true;
+        }
+
+        return false;
     }
 
     // ── Private ────────────────────────────────────────────────────────────────

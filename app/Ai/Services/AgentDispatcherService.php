@@ -9,6 +9,7 @@ use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Laravel\Ai\Contracts\Agent;
+use Illuminate\Support\Str;
 
 /**
  * AgentDispatcherService  (v3 — AgentRegistry-driven + outcome signals)
@@ -62,13 +63,24 @@ class AgentDispatcherService
         array   $attachments    = [],
         bool    $hitlConfirmed  = false,
     ): array {
-        $multiIntent        = count($intents) > 1;
-        $results            = [];
+        $multiIntent = count($intents) > 1;
+        $turnId      = $multiIntent ? Str::uuid()->toString() : null;
+        $results     = [];
+        $blackboard  = new AgentContextBlackboard();
+
+        // ── FIX: pre-generate base ID for new multi-intent sessions ──────────
+        // When conversationId is null AND we have multiple intents, generate the
+        // base UUID upfront. This ensures the first agent is scoped as
+        // "{base}:{intent}" from the very first turn — not at the bare base ID.
+        // Without this, Turn 1 client lands at "base", but Turn 2 client tries
+        // to continue "base:client" — a different, empty conversation.
+        if ($multiIntent && $conversationId === null) {
+            $conversationId = Str::uuid()->toString();
+        }
+
         $baseConversationId = $conversationId;
-        $blackboard         = new AgentContextBlackboard();
 
         foreach ($intents as $index => $intent) {
-
             $result = $this->dispatch(
                 intent:         $intent,
                 user:           $user,
@@ -78,16 +90,14 @@ class AgentDispatcherService
                 attachments:    $attachments,
                 blackboard:     $blackboard,
                 hitlConfirmed:  $hitlConfirmed,
+                turnId:         $turnId,
             );
 
             $results[$intent] = $result;
-
             $blackboard->record($intent, $result['reply']);
 
-            // BUG 4 FIX: strip ":intent" scope suffix when capturing base ID
-            if ($index === 0 && $baseConversationId === null) {
+            if ($index === 0 && $baseConversationId === null && !($result['_error'] ?? false)) {
                 $rawId = $result['conversation_id'] ?? null;
-
                 $baseConversationId = ($multiIntent && $rawId !== null)
                     ? explode(':', $rawId)[0]
                     : $rawId;
@@ -119,6 +129,7 @@ class AgentDispatcherService
         array                   $attachments     = [],
         ?AgentContextBlackboard $blackboard      = null,
         bool                    $hitlConfirmed   = false,
+        ?string $turnId = null
     ): array {
         $start = microtime(true);
         $model = AgentRegistry::AGENT_MODELS[$intent] ?? 'gpt-4o';
@@ -173,10 +184,14 @@ class AgentDispatcherService
             $inputTokens  = $usageData['prompt_tokens']     ?? null;
             $outputTokens = $usageData['completion_tokens'] ?? null;
 
+            $scopedConversationId = $response->conversationId;
+            $resolvedBaseId = explode(':', $scopedConversationId)[0];
+
+
             $this->observability->recordAgentCall(
                 intent:         $intent,
                 userId:         (string) $user->id,
-                conversationId: $conversationId,
+                conversationId: $resolvedBaseId,
                 model:          $model,
                 latencyMs:      $latencyMs,
                 inputTokens:    $inputTokens,
@@ -189,6 +204,7 @@ class AgentDispatcherService
                 conversationId: $response->conversationId,
                 intent:         $intent,
                 multiIntent:    $multiIntent,
+                turnId:         $turnId,
             );
 
             return [
@@ -219,6 +235,7 @@ class AgentDispatcherService
             return [
                 'reply'           => $this->errorResponse($intent),
                 'conversation_id' => $conversationId,
+                '_error'          => true,   // ← add this flag
             ];
         }
     }
@@ -257,29 +274,28 @@ class AgentDispatcherService
         string  $intent,
         bool    $multiIntent,
     ): Agent {
+        // No existing conversation — start fresh
         if ($conversationId === null) {
             return $agent->forUser($user);
         }
 
-        // If this is a DB fallback turn (multiIntent=false but a scoped conversation
-        // exists for this intent), restore the scoped ID so the agent has its history.
-        $scopedId = "{$conversationId}:{$intent}";
+        // Multi-intent: always scope per-intent so agents don't share history
+        if ($multiIntent) {
+            return $agent->continue("{$conversationId}:{$intent}", as: $user);
+        }
 
+        // Single-intent: check if a scoped conversation exists from a prior
+        // multi-intent turn. This handles the DB fallback case where the user
+        // sends a follow-up like "make it ₹5000 instead" after a multi-intent turn.
+        $scopedId = "{$conversationId}:{$intent}";
         $scopedExists = DB::table('agent_conversation_messages')
             ->where('conversation_id', $scopedId)
             ->exists();
 
-        if ($scopedExists) {
-            // Resume the scoped conversation — agent will remember its prior turn
-            return $agent->continue($scopedId, as: $user);
-        }
-
-        // Original logic
-        $scopedId = $multiIntent
-            ? "{$conversationId}:{$intent}"
-            : $conversationId;
-
-        return $agent->continue($scopedId, as: $user);
+        return $agent->continue(
+            $scopedExists ? $scopedId : $conversationId,
+            as: $user
+        );
     }
 
     /**
@@ -300,7 +316,7 @@ class AgentDispatcherService
 
         // Only BaseAgent subclasses declare writeTools()
         if ($agentClass === null || !is_subclass_of($agentClass, BaseAgent::class)) {
-            return null;
+            return 'completed';
         }
 
         $writeTools = $agentClass::writeTools();
@@ -394,12 +410,11 @@ class AgentDispatcherService
         ?string $conversationId,
         string  $intent,
         bool    $multiIntent,
+        ?string $turnId = null,   // ← add parameter
     ): void {
-        if ($conversationId === null) {
-            return;
-        }
+        if ($conversationId === null) return;
 
-        DB::transaction(function () use ($conversationId, $intent, $multiIntent): void {
+        DB::transaction(function () use ($conversationId, $intent, $multiIntent, $turnId): void {
             $messageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $conversationId)
                 ->where('role', 'assistant')
@@ -407,13 +422,15 @@ class AgentDispatcherService
                 ->lockForUpdate()
                 ->first();
 
-            if ($messageRow === null) {
-                return;
-            }
+            if ($messageRow === null) return;
 
             $meta                 = json_decode($messageRow->meta ?? '{}', true) ?: [];
             $meta['intent']       = $intent;
             $meta['multi_intent'] = $multiIntent;
+
+            if ($turnId !== null) {
+                $meta['turn_id'] = $turnId;  // ← store it
+            }
 
             DB::table('agent_conversation_messages')
                 ->where('id', $messageRow->id)

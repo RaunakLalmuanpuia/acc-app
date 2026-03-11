@@ -147,6 +147,7 @@ class AiChatController extends Controller
     {
         $request->validate([
             'pending_id'    => ['required', 'string', 'uuid'],
+            'conversation_id' => ['nullable', 'string', 'uuid'],
             'attachments'   => ['nullable', 'array', 'max:5'],
             'attachments.*' => [
                 'file',

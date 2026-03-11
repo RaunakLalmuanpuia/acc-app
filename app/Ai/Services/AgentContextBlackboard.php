@@ -100,6 +100,11 @@ class AgentContextBlackboard
             '╔══════════════════════════════════════════════════════════════╗',
             '║  PRIOR AGENT CONTEXT — treat as established fact             ║',
             '║  Do NOT re-fetch, re-create, or contradict this information. ║',
+            '║  CRITICAL: This context was ALREADY shown to the user.       ║',  // ← ADD
+            '║  Do NOT repeat, summarise, or mention it in your reply.      ║',
+            '║  If a prior agent asked for missing info, that resource does ║',
+            '║  NOT exist yet. Tell the user to complete that step first.   ║',
+            '║  Use it silently for lookups and decisions only.             ║',  // ← ADD
             '╚══════════════════════════════════════════════════════════════╝',
             '',
         ];

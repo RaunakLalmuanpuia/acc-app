@@ -48,6 +48,9 @@ class InvoiceAgent extends BaseAgent
     protected function domainInstructions(): string
     {
         $company = $this->user->companies()->first();
+        if (!$company) {
+            return "Please set up your business profile first before managing invoices.";
+        }
         $today   = now()->toDateString();
 
         return <<<PROMPT
