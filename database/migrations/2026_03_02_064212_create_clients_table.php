@@ -27,8 +27,8 @@ return new class extends Migration
             // Address
             $table->text('address')->nullable();
             $table->string('city')->nullable();
-            $table->string('state');
-            $table->string('state_code', 5);
+            $table->string('state')->nullable();
+            $table->string('state_code')->nullable();
             $table->string('pincode', 10)->nullable();
             $table->string('country', 100)->default('India');
 
