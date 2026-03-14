@@ -3,6 +3,7 @@
 namespace App\Ai\Services;
 
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 
 /**
  * ObservabilityService  (v3 — IBM AgentOps evaluation alignment)
@@ -80,6 +81,9 @@ class ObservabilityService
      */
     private array $turnMetrics = [];
 
+
+    private ?string $turnId = null;
+
     /**
      * Record a single specialist agent call.
      *
@@ -113,6 +117,7 @@ class ObservabilityService
             'intent'             => $intent,
             'user_id'            => $userId,
             'conversation_id'    => $conversationId,
+            'turn_id'            => $this->turnId,
             'model'              => $model,
             'latency_ms'         => $latencyMs,
             'input_tokens'       => $inputTokens,
@@ -122,8 +127,10 @@ class ObservabilityService
             'success'            => $success,
             'outcome'            => $outcome,    // v3 evaluation signal
             'error'              => $errorMessage,
-            'timestamp'          => now()->toIso8601String(),
+            'created_at'         => now()->toIso8601String(),
         ];
+
+        DB::table('agent_metrics')->insert($metric);
 
         $this->turnMetrics[] = $metric;
 
@@ -186,8 +193,25 @@ class ObservabilityService
             'per_agent'            => $this->turnMetrics,
         ]);
 
+
+        DB::table('agent_turn_metrics')->insert([
+            'turn_id' => $this->turnId,
+            'conversation_id' => $conversationId,
+            'user_id' => $userId,
+            'agent_count' => count($intents),
+            'total_latency_ms' => $totalLatencyMs,
+            'total_tokens' => $totalTokens,
+            'total_cost_usd' => $totalCostUsd,
+            'failed_agent_count' => count($failedAgents),
+            'all_succeeded' => count($failedAgents) === 0,
+            'completion_rate_pct' => $completionRate,
+            'outcome_distribution' => json_encode($outcomes),
+            'intents' => json_encode($intents),
+            'created_at' => now(),
+        ]);
         // Reset buffer — ready for the next turn
         $this->turnMetrics = [];
+        $this->turnId = null;
     }
 
     /**
@@ -221,5 +245,9 @@ class ObservabilityService
             ($outputTokens / 1000 * $rates['output']),
             6
         );
+    }
+    public function setTurnId(string $turnId): void
+    {
+        $this->turnId = $turnId;
     }
 }

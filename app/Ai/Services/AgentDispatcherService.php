@@ -60,11 +60,11 @@ class AgentDispatcherService
         User    $user,
         string  $message,
         ?string $conversationId,
+        string  $turnId,
         array   $attachments    = [],
         bool    $hitlConfirmed  = false,
     ): array {
         $multiIntent = count($intents) > 1;
-        $turnId      = $multiIntent ? Str::uuid()->toString() : null;
         $results     = [];
         $blackboard  = new AgentContextBlackboard();
 

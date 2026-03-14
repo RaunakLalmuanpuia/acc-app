@@ -8,7 +8,7 @@ use App\Ai\Services\IntentRouterService;
 use App\Ai\Services\ObservabilityService;
 use App\Ai\Services\ResponseMergerService;
 use App\Ai\Services\ScopeGuardService;
-
+use Illuminate\Support\Str;
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -85,7 +85,8 @@ class ChatOrchestrator
         array   $attachments = [],
     ): array {
         $turnStart = microtime(true);
-
+        $turnId = Str::uuid()->toString();
+        $this->observability->setTurnId($turnId);
         // ── Step 0: Scope guard — zero AI cost, runs before everything ────────
         $guardResult = $this->scopeGuard->evaluate($message, (string) $user->id);
 
@@ -175,6 +176,7 @@ class ChatOrchestrator
             intents:        $intents,
             attachments:    $attachments,
             turnStart:      $turnStart,
+            turnId: $turnId
         );
     }
 
@@ -268,6 +270,7 @@ class ChatOrchestrator
         array   $intents,
         array   $attachments,
         float   $turnStart,
+        string  $turnId,
         bool    $hitlConfirmed  = false,
     ): array {
         $responses = $this->dispatcher->dispatchAll(
@@ -277,6 +280,7 @@ class ChatOrchestrator
             conversationId: $conversationId,
             attachments:    $attachments,
             hitlConfirmed:  $hitlConfirmed,
+            turnId: $turnId
         );
 
         $first  = !empty($responses) ? reset($responses) : [];
