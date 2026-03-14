@@ -14,29 +14,6 @@ use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
 use Laravel\Ai\Enums\Lab;
 
-/**
- * ClientAgent  (v3 — extends BaseAgent)
- *
- * Specialist for client/customer record management.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THIS FILE IS ALSO A TEMPLATE FOR NEW AGENTS
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * To create a new agent:
- *   1. Copy this file, rename class and file to YourDomainAgent.
- *   2. Update getCapabilities() for your domain.
- *   3. Update writeTools() to list your write tool names.
- *   4. Write your domainInstructions() — workflow + rules specific to your domain.
- *   5. Return your tools from tools().
- *   6. Add #[Model], #[MaxSteps], #[MaxTokens], #[Temperature] attributes.
- *   7. Add one line to AgentRegistry::AGENTS.
- *   8. Done — router, HITL, observability, and dispatcher all update automatically.
- *
- * DO NOT add IBM standard blocks (plan-first, loop-guard, HITL awareness) to
- * domainInstructions() — BaseAgent::instructions() injects them automatically
- * based on your declared capabilities.
- */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
 #[MaxSteps(15)]
@@ -44,16 +21,6 @@ use Laravel\Ai\Enums\Lab;
 #[Temperature(0.1)]
 class ClientAgent extends BaseAgent
 {
-    /**
-     * Declare what this agent can do.
-     *
-     * READS        → can call get_clients
-     * WRITES       → can create and update client records
-     * DESTRUCTIVE  → can delete client records (triggers HITL checkpoint)
-     * REFERENCE_ONLY → client names are referenced by InvoiceAgent;
-     *                  mentioning a client name in an invoice request must NOT
-     *                  trigger a standalone ClientAgent dispatch.
-     */
     public static function getCapabilities(): array
     {
         return [
@@ -64,28 +31,11 @@ class ClientAgent extends BaseAgent
         ];
     }
 
-    /**
-     * The tool names that constitute a write operation for this agent.
-     * Used by AgentDispatcherService to resolve the IBM AgentOps outcome signal.
-     *
-     * @return string[]
-     */
     public static function writeTools(): array
     {
         return ['create_client', 'update_client', 'delete_client'];
     }
 
-    /**
-     * Client-specific behaviour instructions.
-     *
-     * BaseAgent::instructions() wraps this with:
-     *   - Header (agent identity + today's date)
-     *   - PLAN FIRST / ReWOO block
-     *   - LOOP GUARD block
-     *   - DESTRUCTIVE OPERATIONS / HITL block (because DESTRUCTIVE is declared)
-     *
-     * Write ONLY your domain rules here — do not duplicate the standard blocks.
-     */
     protected function domainInstructions(): string
     {
         return <<<PROMPT
@@ -102,40 +52,63 @@ class ClientAgent extends BaseAgent
              already exists — do you want to update them instead?"
            • Not found → proceed to gather missing fields.
 
-        2. GATHER GAPS — Required to create (minimum viable):
-           • Full name      (required)
-           • Email address  (required)
+        2. GATHER GAPS — Minimum viable to create:
+           • Full name  (required — already provided if user named the client)
+           • Phone      (required)
+           • Email      (required)
 
-           Optional fields: phone, billing address, GSTIN, PAN, GST type,
-           city, state, state code, pincode, country, currency, payment terms,
-           credit limit, notes.
+           Collect only what is MISSING. Ask for ONLY the missing required
+           fields — never optional ones upfront.
 
-           RULE: Once you have name + email, you have enough to create.
-           Collect any optional fields the user HAS already provided.
-           Do NOT ask for optional fields that are missing — create immediately
-           and inform the user they can be updated later.
+           PARSING RULE for multi-value messages like "7640876052, xyz@mail.com, 200":
+            - A token containing @ → email.
+            - A 10-digit number → phone.
+            - Any remaining number in a message that asks for phone + email → IGNORE IT.
+              It belongs to another agent (InventoryAgent needs it as the rate).
+              Do NOT pass it as credit_limit, payment_terms, or any other client field.
 
-        3. CREATE — Call create_client with name, email, and any optionals
-           already provided. After creating, present the record in a table and
-           add ONE line: "Phone, GSTIN, and address can be updated anytime."
+            Only use numbers as client fields when the user explicitly labels them:
+              "credit limit 5000" → credit_limit: 5000
+              "payment terms 30"  → payment_terms: 30
+            An unlabeled number alongside phone + email is always the inventory rate — ignore it.
+
+           CRITICAL — when gathering info as part of an invoice request:
+           End your reply with EXACTLY this line:
+           "⏳ Once I have these details, I'll create the client and your invoice will proceed."
+
+           Do NOT ask for optional fields (GSTIN, address, etc.).
+
+        3. CREATE — Call create_client. After creating, present the record in a
+           table and add ONE line:
+           "Phone, GSTIN, and address can be updated anytime."
+
+           INVOICE WORKFLOW: If the original user message mentioned an invoice,
+           end your reply with EXACTLY:
+           "✅ Client created. Proceeding to create your invoice now."
+           Then output NOTHING else — no questions, no optional field prompts.
+
+        ── ALREADY CREATED / HANDOFF ─────────────────────────────────────────
+
+        If the conversation history shows a client was ALREADY created in a
+        prior message (look for "created successfully" or "✅ Client"), AND the
+        current message is "yes", "proceed", "ok", "go ahead", or similar with
+        no new client data — reply with ONLY the single word:
+        HANDOFF
+        Do not add any other text.
 
         ── UPDATING A CLIENT ─────────────────────────────────────────────────
 
         1. SEARCH FIRST — Call get_clients to locate the record.
            If multiple matches, list them and ask which one.
-
-        2. SHOW CURRENT VALUES — Present what will change vs current values.
-
+        2. SHOW CURRENT VALUES — Present what will change.
         3. CONFIRM CHANGE — Ask: "Shall I update [field] from [old] to [new]?"
-
         4. UPDATE — Call update_client only after explicit yes.
 
         ── DELETING A CLIENT ─────────────────────────────────────────────────
 
-        The HITL checkpoint (handled upstream) will have intercepted this
-        before this agent is called. When the ✅ HITL PRE-AUTHORIZED block
-        is present, execute delete_client immediately after a get_clients
-        lookup to confirm the correct record ID.
+        The HITL checkpoint (handled upstream) will have intercepted this.
+        When the ✅ HITL PRE-AUTHORIZED block is present, execute delete_client
+        immediately after a get_clients lookup to confirm the correct record ID.
 
         ── GENERAL ───────────────────────────────────────────────────────────
 
@@ -143,8 +116,6 @@ class ClientAgent extends BaseAgent
         • Present client details in a clean table format.
         • If a GSTIN is provided, display it formatted (e.g. 29ABCDE1234F1Z5).
         • Never store or display full payment card numbers.
-
-        • If the conversation history shows the client was already created and the current message is unrelated to client management, reply with nothing.
         PROMPT;
     }
 

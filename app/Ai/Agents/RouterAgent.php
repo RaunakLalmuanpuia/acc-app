@@ -15,40 +15,21 @@ use Laravel\Ai\Promptable;
 use Stringable;
 
 /**
- * RouterAgent  (v4 — AgentRegistry-driven, fully dynamic)
- *
- * Ultra-cheap, stateless intent classifier.
+ * RouterAgent  (v5 — co-routing exception for new clients/inventory)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v3
+ * CHANGES FROM v4
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * v3 hardcoded Rules 6 and 7 specifically for 'client' and 'inventory'.
- * That meant every new agent with REFERENCE_ONLY capability required a manual
- * edit to the router's instructions — a maintenance trap.
+ * The REFERENCE_ONLY suppression rule for "client" now includes an explicit
+ * EXCEPTION: when the invoice names a likely-new or unfamiliar client, include
+ * "client" so ClientAgent can check existence and create if needed.
  *
- * v4 derives the routing suppression rules dynamically from AgentRegistry:
- *   - AgentRegistry::referenceOnlyIntents() returns all intents whose agent
- *     declares AgentCapability::REFERENCE_ONLY.
- *   - instructions() builds the suppression rules in a loop — adding a new
- *     REFERENCE_ONLY agent automatically adds a new router rule with zero
- *     manual changes to this file.
+ * Similarly, when an invoice names a product that sounds like it may not be in
+ * inventory yet (combined with a new/unknown client), include "inventory".
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * IBM ALIGNMENT
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * IBM Plan-and-Execute:
- *   "A capable model creates a strategy that cheaper models execute — reducing
- *    costs by up to 90%." (ibm.com/think/topics/ai-agents)
- *
- * The RouterAgent IS the planner. Its job is precise classification so that
- * the expensive Worker agents (gpt-4o specialists) are only dispatched when
- * genuinely needed. Over-routing defeats the entire Plan-and-Execute pattern.
- *
- * IBM on intent precision:
- *   "When in doubt, exclude the domain. A missed intent costs one clarifying
- *    question. An extra intent costs one unnecessary gpt-4o call."
+ * The suppression rules are still derived dynamically from AgentRegistry —
+ * the exception text is injected via the $examples array which is human-curated.
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o-mini')]
@@ -59,10 +40,6 @@ class RouterAgent implements Agent, HasTools
 {
     use Promptable;
 
-    /**
-     * Valid domain intents the router may emit.
-     * Derived from AgentRegistry — keep this in sync.
-     */
     public static function getIntents(): array
     {
         return [...AgentRegistry::validIntents(), 'unknown'];
@@ -79,16 +56,8 @@ class RouterAgent implements Agent, HasTools
         This assistant exists solely to help users manage their accounting data:
         invoices, clients, inventory, narration heads, business profile, and bank transactions.
 
-        You are NOT a general-purpose AI. You are NOT a chatbot. You are NOT an assistant
-        for coding, writing, travel, legal advice, medical advice, or any other domain.
-
-        Your only job is to classify the user's message into one of the accounting intents
-        below. If the message is not about accounting, classify it as "unknown" — do NOT
-        attempt to answer it, do NOT engage with it, do NOT acknowledge the topic.
-
-
-        Your only job is to read the user's message and classify it into one or more
-        of the following domain intents:
+        You are NOT a general-purpose AI. Your only job is to classify the user's
+        message into one or more of the following domain intents:
 
             {$intents}
 
@@ -102,18 +71,15 @@ class RouterAgent implements Agent, HasTools
         RULES  (read every rule before deciding)
         ─────────────────────────────────────────────────────────────────────────
 
-        1. Return ONLY a raw JSON object — no markdown code fences, no explanation,
-           no preamble.
+        1. Return ONLY a raw JSON object — no markdown, no explanation.
 
         2. Multi-intent is allowed ONLY when the message explicitly requests
-           operations in multiple domains. Both operations must be primary goals,
-           not incidental references.
+           operations in multiple domains. Both must be primary goals.
 
-        3. Use "unknown" when the message is a greeting, thank-you, or off-topic.
+        3. Use "unknown" for greetings, thank-yous, or off-topic messages.
 
-        4. When in doubt, EXCLUDE the domain. Prefer fewer intents over more.
-           A missed intent costs one clarifying question.
-           An extra intent costs one unnecessary specialist agent call.
+        4. When in doubt, EXCLUDE the domain. A missed intent costs one
+           clarifying question. An extra intent costs one unnecessary agent call.
 
         5. Never include the same intent twice.
 
@@ -125,13 +91,11 @@ class RouterAgent implements Agent, HasTools
 
         {"intents": ["invoice"]}
         {"intents": ["client", "invoice"]}
+        {"intents": ["client", "inventory", "invoice"]}
         {"intents": ["unknown"]}
         PROMPT;
     }
 
-    /**
-     * The router carries zero tools — tool schemas add tokens with no benefit here.
-     */
     public function tools(): iterable
     {
         return [];
@@ -139,45 +103,31 @@ class RouterAgent implements Agent, HasTools
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    /**
-     * Build the domain definitions block.
-     * Hardcoded descriptions per intent — these are human-curated and intentionally
-     * not derived from agent classes (agents don't know their own routing description).
-     */
     private function buildDomainDefinitions(): string
     {
         $definitions = [
-            'invoice'   => 'creating, confirming, viewing, updating, deleting, or generating
-                     PDFs for invoices; recording payments; checking overdue invoices.',
-            'client'    => 'listing, searching, creating, updating, deleting, or looking up client records as the PRIMARY GOAL of the message.',
-            'inventory' => 'listing, searching, creating, updating, deleting, or looking up inventory items / products / services as the PRIMARY GOAL.',
-            'narration' => 'narration heads, sub-heads, transaction categories, ledger heads.',
-            'business'  => 'company/business profile, GST number, PAN, bank details, address.',
-            'bank_transaction' => 'reviewing, narrating (categorising), flagging, or reconciling
-                         bank transactions; viewing transaction history; matching credits to invoices.',  // ← ADD THIS
-            'unknown'   => 'greetings, thank-yous, out-of-scope questions, or anything
-                     unrelated to accounting.',
+            'invoice'          => 'creating, confirming, viewing, updating, deleting, or generating
+                                   PDFs for invoices; recording payments; checking overdue invoices.',
+            'client'           => 'listing, searching, creating, updating, or deleting client records
+                                   as the PRIMARY GOAL — OR when invoicing a client who may not exist yet.',
+            'inventory'        => 'listing, searching, creating, updating, or deleting inventory items /
+                                   products / services as the PRIMARY GOAL.',
+            'narration'        => 'narration heads, sub-heads, transaction categories, ledger heads.',
+            'business'         => 'company/business profile, GST number, PAN, bank details, address.',
+            'bank_transaction' => 'reviewing, categorising, flagging, or reconciling bank transactions;
+                                   viewing transaction history; matching credits to invoices.',
+            'unknown'          => 'greetings, thank-yous, out-of-scope questions, or anything
+                                   unrelated to accounting.',
         ];
 
         $lines = [];
         foreach ($definitions as $intent => $description) {
-            $lines[] = "  {$intent}" . str_repeat(' ', max(1, 12 - strlen($intent))) . "→ {$description}";
+            $lines[] = "  {$intent}" . str_repeat(' ', max(1, 18 - strlen($intent))) . "→ {$description}";
         }
 
         return implode("\n", $lines);
     }
 
-    /**
-     * Dynamically build the REFERENCE_ONLY suppression rules from AgentRegistry.
-     *
-     * For every intent that declares AgentCapability::REFERENCE_ONLY, we emit
-     * a numbered rule explaining that merely referencing that domain's entity
-     * inside another domain's request does not constitute an intent for it.
-     *
-     * This means adding a new REFERENCE_ONLY agent (e.g. NarrationAgent if
-     * narration heads are referenced inside invoice narrations) automatically
-     * produces a new rule here — no manual edit required.
-     */
     private function buildSuppressionRules(): string
     {
         $referenceOnlyIntents = AgentRegistry::referenceOnlyIntents();
@@ -186,21 +136,32 @@ class RouterAgent implements Agent, HasTools
             return '';
         }
 
-        // Static examples per intent — used in the rule to make it concrete
         $examples = [
-            'client'    => [
-                'reference' => 'mentioning a client name inside an invoice request',
-                'wrong'     => '"create invoice for Infosys"          → ["invoice","client"]',
-                'right1'    => '"create invoice for Infosys"          → ["invoice"]',
-                'right2'    => '"add a new client called Infosys"     → ["client"]',
-                'right3'    => '"add Infosys and invoice them ₹5000"  → ["client","invoice"]',
+            'client' => [
+                'reference' => 'mentioning an EXISTING client name inside an invoice request',
+                'wrong'     => '"invoice for Infosys" (Infosys is a known existing client) → ["invoice","client"]',
+                'right1'    => '"invoice for Infosys" (Infosys already exists)             → ["invoice"]',
+                'right2'    => '"add a new client called Infosys"                          → ["client"]',
+                'right3'    => '"add Infosys and invoice them ₹5000"                       → ["client","invoice"]',
+                'right4'    => '"create invoice for XYZ, they want 30 chairs"              → ["client","inventory","invoice"]',
+                'note'      => 'EXCEPTION — include "client" when the invoice names an unfamiliar
+                   or likely-new client (short names, unknown companies, phrases like
+                   "new client", "they are new", "just onboarded"). The ClientAgent will
+                   check existence and create if needed. When in doubt about whether a
+                   client exists, include "client" — the cost of an extra check is lower
+                   than the cost of failing to create a needed client.',
             ],
             'inventory' => [
                 'reference' => 'mentioning a product name or quantity inside an invoice request',
-                'wrong'     => '"add 20 units of Samsung TV to invoice"     → ["invoice","inventory"]',
-                'right1'    => '"add 20 units of Samsung TV to invoice"     → ["invoice"]',
-                'right2'    => '"add Samsung TV to inventory at ₹54,999"    → ["inventory"]',
-                'right3'    => '"add Samsung TV to inventory and invoice 5" → ["inventory","invoice"]',
+                'wrong'     => '"add 20 Samsung TVs to invoice" (TVs already in inventory) → ["invoice","inventory"]',
+                'right1'    => '"add 20 Samsung TVs to invoice" (item exists)              → ["invoice"]',
+                'right2'    => '"add Samsung TV to inventory at ₹54,999"                   → ["inventory"]',
+                'right3'    => '"add Samsung TV to inventory and invoice 5 units"          → ["inventory","invoice"]',
+                'right4'    => '"create invoice for XYZ, they want 30 chairs"              → ["client","inventory","invoice"]',
+                'note'      => 'EXCEPTION — include "inventory" when the invoice names a product
+                   alongside a new/unknown client (the product is also likely missing).
+                   If the message contains both an unfamiliar client AND an unfamiliar
+                   product, return all three: ["client","inventory","invoice"].',
             ],
         ];
 
@@ -211,21 +172,22 @@ class RouterAgent implements Agent, HasTools
             $ex = $examples[$intent] ?? null;
 
             if ($ex) {
+                $note   = isset($ex['note'])   ? "\n   NOTE: {$ex['note']}"   : '';
+                $right4 = isset($ex['right4']) ? "\n   ✓ RIGHT: {$ex['right4']}" : '';
+
                 $rules[] = <<<RULE
                 {$ruleNo}. CRITICAL — "{$intent}" intent = user's PRIMARY GOAL is to manage a {$intent} record.
-                   {$ex['reference']} is NOT a {$intent} intent — the specialist agent already
-                   has lookup tools to resolve {$intent} names without a separate dispatch.
-                   ✗ WRONG: {$ex['wrong']}
-                   ✓ RIGHT: {$ex['right1']}
-                   ✓ RIGHT: {$ex['right2']}
-                   ✓ RIGHT: {$ex['right3']}
+                   {$ex['reference']} is NOT a {$intent} intent on its own.
+                   ✗ WRONG:  {$ex['wrong']}
+                   ✓ RIGHT:  {$ex['right1']}
+                   ✓ RIGHT:  {$ex['right2']}
+                   ✓ RIGHT:  {$ex['right3']}{$right4}{$note}
                 RULE;
             } else {
-                // Generic rule for intents without curated examples
                 $rules[] = <<<RULE
-                {$ruleNo}. CRITICAL — "{$intent}" intent means the user's PRIMARY GOAL is to perform
-                   a {$intent} management operation. Merely referencing a {$intent} name or concept
-                   inside another domain's request does NOT constitute a "{$intent}" intent.
+                {$ruleNo}. CRITICAL — "{$intent}" intent means the user's PRIMARY GOAL is a {$intent}
+                   management operation. Merely referencing a {$intent} name inside another
+                   domain's request does NOT constitute a "{$intent}" intent.
                 RULE;
             }
 

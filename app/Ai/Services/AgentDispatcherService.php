@@ -12,31 +12,30 @@ use Laravel\Ai\Contracts\Agent;
 use Illuminate\Support\Str;
 
 /**
- * AgentDispatcherService  (v3 — AgentRegistry-driven + outcome signals)
- *
- * Resolves an intent to its specialist agent, enriches the message with
- * inter-agent context (blackboard), dispatches the prompt, records
- * observability metrics, and writes conversation metadata atomically.
+ * AgentDispatcherService  (v4 — invoice number injection)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v2
+ * CHANGES FROM v3
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * AGENT_MAP and AGENT_MODELS removed — both are now sourced from AgentRegistry.
- *   Adding a new agent requires only one line in AgentRegistry::AGENTS.
- *   No changes needed here.
+ * FIX 1 — Invoice number injection
+ *   dispatchAll() and dispatch() accept an optional $activeInvoiceNumber.
+ *   When provided for the invoice intent, buildMessage() injects it as a
+ *   system hint block at the top of InvoiceAgent's prompt. This ensures the
+ *   agent can always recover its working invoice even when the scoped
+ *   conversation history is fragmented across multi-intent turns.
  *
- * OUTCOME SIGNAL added to recordAgentCall():
- *   After prompt() returns, dispatcher checks whether the agent called any write
- *   tools by comparing toolsUsed against BaseAgent::writeTools() for the intent.
- *   This populates ObservabilityService's new $outcomeSignal parameter:
- *     'completed'  → agent called at least one write tool, no trailing question
- *     'clarifying' → agent returned a question without calling any write tool
- *     'partial'    → agent called a write tool but also asked a question
- *   Falls back to null if SDK does not expose toolsUsed.
+ * FIX 2 — Invoice number extraction + meta storage
+ *   After each invoice agent call, the reply is scanned for INV-YYYYMMDD-XXXXX.
+ *   If found, the number is stored in the message's meta column via
+ *   writeMetaToMessage(). ChatOrchestrator reads this on subsequent turns via
+ *   loadActiveInvoiceNumber() and injects it back here.
  *
- * All bug fixes from v2 (BUG 1–4) are preserved unchanged.
- * All GAP 1 (blackboard) and GAP 3 (observability) work is preserved.
+ * FIX 3 — outcomeSignal stored in meta
+ *   writeMetaToMessage() now persists the outcome signal alongside intent/turn_id.
+ *   Used by ChatOrchestrator's content-based completion check.
+ *
+ * All v3 fixes (scoped conversation, blackboard, observability) are preserved.
  */
 class AgentDispatcherService
 {
@@ -46,14 +45,6 @@ class AgentDispatcherService
 
     /**
      * Dispatch multiple intents sequentially, sharing an AgentContextBlackboard.
-     *
-     * @param  string[]    $intents
-     * @param  User        $user
-     * @param  string      $message
-     * @param  string|null $conversationId
-     * @param  array       $attachments
-     * @param  bool        $hitlConfirmed
-     * @return array<string, array{reply: string, conversation_id: ?string}>
      */
     public function dispatchAll(
         array   $intents,
@@ -61,19 +52,14 @@ class AgentDispatcherService
         string  $message,
         ?string $conversationId,
         string  $turnId,
-        array   $attachments    = [],
-        bool    $hitlConfirmed  = false,
+        array   $attachments         = [],
+        bool    $hitlConfirmed        = false,
+        ?string $activeInvoiceNumber  = null,
     ): array {
         $multiIntent = count($intents) > 1;
         $results     = [];
         $blackboard  = new AgentContextBlackboard();
 
-        // ── FIX: pre-generate base ID for new multi-intent sessions ──────────
-        // When conversationId is null AND we have multiple intents, generate the
-        // base UUID upfront. This ensures the first agent is scoped as
-        // "{base}:{intent}" from the very first turn — not at the bare base ID.
-        // Without this, Turn 1 client lands at "base", but Turn 2 client tries
-        // to continue "base:client" — a different, empty conversation.
         if ($multiIntent && $conversationId === null) {
             $conversationId = Str::uuid()->toString();
         }
@@ -81,16 +67,23 @@ class AgentDispatcherService
         $baseConversationId = $conversationId;
 
         foreach ($intents as $index => $intent) {
+            // Small pause between sequential agent calls to avoid rate limiting.
+            // Skip on the first call — no need to delay before we start.
+            if ($index > 0) {
+                usleep(300_000); // 300ms
+            }
+
             $result = $this->dispatch(
-                intent:         $intent,
-                user:           $user,
-                message:        $message,
-                conversationId: $baseConversationId,
-                multiIntent:    $multiIntent,
-                attachments:    $attachments,
-                blackboard:     $blackboard,
-                hitlConfirmed:  $hitlConfirmed,
-                turnId:         $turnId,
+                intent:              $intent,
+                user:                $user,
+                message:             $message,
+                conversationId:      $baseConversationId,
+                multiIntent:         $multiIntent,
+                attachments:         $attachments,
+                blackboard:          $blackboard,
+                hitlConfirmed:       $hitlConfirmed,
+                turnId:              $turnId,
+                activeInvoiceNumber: $activeInvoiceNumber,
             );
 
             $results[$intent] = $result;
@@ -109,27 +102,18 @@ class AgentDispatcherService
 
     /**
      * Dispatch a single intent to its specialist agent.
-     *
-     * @param  string                      $intent
-     * @param  User                        $user
-     * @param  string                      $message
-     * @param  string|null                 $conversationId
-     * @param  bool                        $multiIntent
-     * @param  array                       $attachments
-     * @param  AgentContextBlackboard|null $blackboard
-     * @param  bool                        $hitlConfirmed
-     * @return array{reply: string, conversation_id: ?string}
      */
     public function dispatch(
         string                  $intent,
         User                    $user,
         string                  $message,
         ?string                 $conversationId,
-        bool                    $multiIntent     = false,
-        array                   $attachments     = [],
-        ?AgentContextBlackboard $blackboard      = null,
-        bool                    $hitlConfirmed   = false,
-        ?string $turnId = null
+        bool                    $multiIntent        = false,
+        array                   $attachments        = [],
+        ?AgentContextBlackboard $blackboard         = null,
+        bool                    $hitlConfirmed      = false,
+        ?string                 $turnId             = null,
+        ?string                 $activeInvoiceNumber = null,
     ): array {
         $start = microtime(true);
         $model = AgentRegistry::AGENT_MODELS[$intent] ?? 'gpt-4o';
@@ -154,24 +138,53 @@ class AgentDispatcherService
             ]);
 
             $prompt = $this->buildMessage(
-                intent:        $intent,
-                message:       $message,
-                blackboard:    $blackboard,
-                multiIntent:   $multiIntent,
-                hitlConfirmed: $hitlConfirmed,
+                intent:              $intent,
+                message:             $message,
+                blackboard:          $blackboard,
+                multiIntent:         $multiIntent,
+                hitlConfirmed:       $hitlConfirmed,
+                activeInvoiceNumber: $activeInvoiceNumber,
             );
 
-            $response = $agent->prompt(
-                prompt:      $prompt,
-                attachments: $attachments,
-            );
+            $response  = null;
+            $attempts  = 0;
+            $maxTries  = 5;
+            $baseDelay = 2; // seconds
 
-            $latencyMs = (int) ((microtime(true) - $start) * 1000);
+            while ($attempts < $maxTries) {
+                try {
+                    $response = $agent->prompt(
+                        prompt:      $prompt,
+                        attachments: $attachments,
+                    );
+                    break; // success — exit retry loop
+                } catch (\Throwable $e) {
+                    $attempts++;
+                    $isRateLimit = str_contains($e->getMessage(), 'rate limit')
+                        || str_contains($e->getMessage(), 'RateLimited')
+                        || str_contains($e->getMessage(), 'rate_limit_exceeded')
+                        || ($e instanceof \Laravel\Ai\Exceptions\RateLimitedException);
 
-            // ── Outcome signal (IBM AgentOps evaluation layer) ─────────────
+                    if ($isRateLimit && $attempts < $maxTries) {
+                        $delay = $baseDelay * (2 ** ($attempts - 1)); // 2s, 4s
+                        Log::warning("[AgentDispatcherService] Rate limited — retrying in {$delay}s", [
+                            'intent'   => $intent,
+                            'attempt'  => $attempts,
+                            'max'      => $maxTries,
+                        ]);
+                        sleep($delay);
+                        continue;
+                    }
+
+                    // Non-rate-limit error or exhausted retries — rethrow to outer catch
+                    throw $e;
+                }
+            }
+
+            $latencyMs     = (int) ((microtime(true) - $start) * 1000);
             $outcomeSignal = $this->resolveOutcomeSignal($intent, $response);
 
-            // ── Token usage from DB (see v2 comment for why DB not $response) ─
+            // ── Token usage from DB ────────────────────────────────────────────
             $scopedConversationId = $response->conversationId;
             $usageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $scopedConversationId)
@@ -184,9 +197,7 @@ class AgentDispatcherService
             $inputTokens  = $usageData['prompt_tokens']     ?? null;
             $outputTokens = $usageData['completion_tokens'] ?? null;
 
-            $scopedConversationId = $response->conversationId;
             $resolvedBaseId = explode(':', $scopedConversationId)[0];
-
 
             $this->observability->recordAgentCall(
                 intent:         $intent,
@@ -200,20 +211,36 @@ class AgentDispatcherService
                 outcomeSignal:  $outcomeSignal,
             );
 
+            // ── FIX 2: extract and store invoice number from reply ─────────────
+            $replyText     = (string) $response;
+            $invoiceNumber = null;
+
+            if ($intent === 'invoice') {
+                if (preg_match('/INV-\d{8}-\d+/', $replyText, $matches)) {
+                    $invoiceNumber = $matches[0];
+                }
+            }
+
             $this->writeMetaToMessage(
                 conversationId: $response->conversationId,
                 intent:         $intent,
                 multiIntent:    $multiIntent,
                 turnId:         $turnId,
+                outcomeSignal:  $outcomeSignal,
+                invoiceNumber:  $invoiceNumber,
             );
 
             return [
-                'reply'           => (string) $response,
+                'reply'           => $replyText,
                 'conversation_id' => $response->conversationId,
             ];
 
         } catch (\Throwable $e) {
             $latencyMs = (int) ((microtime(true) - $start) * 1000);
+
+            $isRateLimit = str_contains($e->getMessage(), 'rate limit')
+                || str_contains($e->getMessage(), 'RateLimited')
+                || str_contains($e->getMessage(), 'rate_limit_exceeded');
 
             $this->observability->recordAgentCall(
                 intent:         $intent,
@@ -233,21 +260,17 @@ class AgentDispatcherService
             ]);
 
             return [
-                'reply'           => $this->errorResponse($intent),
+                'reply'           => $isRateLimit
+                    ? "I'm processing a lot right now — please send your message again in a few seconds."
+                    : $this->errorResponse($intent),
                 'conversation_id' => $conversationId,
-                '_error'          => true,   // ← add this flag
+                '_error'          => true,
             ];
         }
     }
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    /**
-     * Instantiate the specialist agent for the given intent.
-     * Reads from AgentRegistry — no local AGENT_MAP needed.
-     *
-     * @throws \InvalidArgumentException If the intent has no registered agent.
-     */
     private function resolveAgent(string $intent, User $user): Agent
     {
         $agents = AgentRegistry::AGENTS;
@@ -258,14 +281,16 @@ class AgentDispatcherService
             );
         }
 
-        $class = $agents[$intent];
-
-        return new $class($user);
+        return new $agents[$intent]($user);
     }
 
     /**
      * Configure the agent's conversation context.
-     * BUG 1 FIX: scopes conversation ID per-intent for multi-intent turns.
+     *
+     * For single-intent follow-ups after a multi-intent setup turn, prefer the
+     * scoped conversation {id}:{intent} if it exists — this ensures the agent
+     * loads the history from the multi-intent setup phase rather than a bare
+     * base conversation with no relevant history.
      */
     private function configureConversation(
         Agent   $agent,
@@ -274,70 +299,52 @@ class AgentDispatcherService
         string  $intent,
         bool    $multiIntent,
     ): Agent {
-        // No existing conversation — start fresh
         if ($conversationId === null) {
             return $agent->forUser($user);
         }
 
-        // Multi-intent: always scope per-intent so agents don't share history
         if ($multiIntent) {
             return $agent->continue("{$conversationId}:{$intent}", as: $user);
         }
 
-        // Single-intent: check if a scoped conversation exists from a prior
-        // multi-intent turn. This handles the DB fallback case where the user
-        // sends a follow-up like "make it ₹5000 instead" after a multi-intent turn.
-        $scopedId = "{$conversationId}:{$intent}";
+        $scopedId     = "{$conversationId}:{$intent}";
         $scopedExists = DB::table('agent_conversation_messages')
             ->where('conversation_id', $scopedId)
             ->exists();
 
-        return $agent->continue(
-            $scopedExists ? $scopedId : $conversationId,
-            as: $user
-        );
+        if ($scopedExists) {
+            Log::info('[AgentDispatcherService] Single-intent follow-up using scoped conversation', [
+                'intent'    => $intent,
+                'scoped_id' => $scopedId,
+            ]);
+            return $agent->continue($scopedId, as: $user);
+        }
+
+        return $agent->continue($conversationId, as: $user);
     }
 
-    /**
-     * Resolve the IBM AgentOps outcome signal for a completed agent call.
-     *
-     * Uses BaseAgent::writeTools() to determine whether the agent performed
-     * a write operation, then checks the response text for trailing questions.
-     *
-     * Falls back to null if the agent class doesn't extend BaseAgent or if
-     * the SDK response doesn't expose toolsUsed (safe — null is handled by
-     * ObservabilityService as "signal not available").
-     *
-     * @return string|null  'completed' | 'clarifying' | 'partial' | null
-     */
     private function resolveOutcomeSignal(string $intent, mixed $response): ?string
     {
         $agentClass = AgentRegistry::AGENTS[$intent] ?? null;
 
-        // Only BaseAgent subclasses declare writeTools()
         if ($agentClass === null || !is_subclass_of($agentClass, BaseAgent::class)) {
             return 'completed';
         }
 
         $writeTools = $agentClass::writeTools();
 
-        // If this agent has no write tools, it is read-only — outcome = 'completed'
-        // (reading successfully is a completion for a read-only agent)
         if (empty($writeTools)) {
             return 'completed';
         }
 
-        // Check whether the SDK response exposes toolsUsed
         $toolsUsed = $response->toolsUsed ?? null;
 
         if ($toolsUsed === null) {
-            // SDK doesn't expose it yet — return null rather than guess
             return null;
         }
 
-        $calledWriteTool = !empty(array_intersect($toolsUsed, $writeTools));
-        $replyText       = (string) $response;
-        $endsWithQuestion = str_ends_with(rtrim($replyText), '?');
+        $calledWriteTool  = !empty(array_intersect($toolsUsed, $writeTools));
+        $endsWithQuestion = str_ends_with(rtrim((string) $response), '?');
 
         return match (true) {
             $calledWriteTool && !$endsWithQuestion => 'completed',
@@ -347,16 +354,23 @@ class AgentDispatcherService
     }
 
     /**
-     * Build the final prompt string for the specialist.
-     * Injects HITL pre-authorisation, blackboard context, and intent scoping.
+     * Build the final prompt string for the specialist agent.
+     *
+     * Injection order (top to bottom in the prompt):
+     *   1. HITL pre-authorization block (if confirmed)
+     *   2. Active invoice hint (if invoice intent and number known)
+     *   3. Blackboard context preamble (prior agent results)
+     *   4. Multi-intent scope wrapper OR raw user message
      */
     private function buildMessage(
         string                  $intent,
         string                  $message,
         ?AgentContextBlackboard $blackboard,
         bool                    $multiIntent,
-        bool                    $hitlConfirmed  = false,
+        bool                    $hitlConfirmed      = false,
+        ?string                 $activeInvoiceNumber = null,
     ): string {
+        // Block 1: HITL
         $hitlBlock = '';
         if ($hitlConfirmed) {
             $hitlBlock = <<<HITL
@@ -376,16 +390,34 @@ class AgentDispatcherService
             HITL;
         }
 
+        // Block 2: Active invoice hint
+        $invoiceHint = '';
+        if ($intent === 'invoice' && $activeInvoiceNumber !== null) {
+            $invoiceHint = <<<HINT
+            ╔══════════════════════════════════════════════════════════════════╗
+            ║  ACTIVE INVOICE: {$activeInvoiceNumber}
+            ╠══════════════════════════════════════════════════════════════════╣
+            ║  This invoice was created earlier in this conversation.          ║
+            ║  REQUIRED: Call get_active_drafts(invoice_number:               ║
+            ║  "{$activeInvoiceNumber}") to retrieve the invoice_id before    ║
+            ║  calling any write tools (add_line_item, generate_invoice_pdf,  ║
+            ║  finalize_invoice). Do NOT invent the invoice_id.               ║
+            ╚══════════════════════════════════════════════════════════════════╝
+
+            HINT;
+        }
+
+        // Block 3: Blackboard preamble
         $preamble = ($blackboard !== null && !$blackboard->isEmpty())
             ? $blackboard->buildContextPreamble($intent)
             : '';
 
         if (!$multiIntent) {
-            return $hitlBlock . $preamble . $message;
+            return $hitlBlock . $invoiceHint . $preamble . $message;
         }
 
         return <<<PROMPT
-        {$hitlBlock}{$preamble}The user message may contain requests for multiple domains.
+        {$hitlBlock}{$invoiceHint}{$preamble}The user message may contain requests for multiple domains.
 
         You are ONLY responsible for the "{$intent}" domain.
 
@@ -404,17 +436,18 @@ class AgentDispatcherService
 
     /**
      * Atomically update the meta column on the latest assistant message.
-     * BUG 3 FIX: PHP-side JSON mutation — no DB::raw interpolation.
      */
     private function writeMetaToMessage(
         ?string $conversationId,
         string  $intent,
         bool    $multiIntent,
-        ?string $turnId = null,   // ← add parameter
+        ?string $turnId        = null,
+        ?string $outcomeSignal = null,
+        ?string $invoiceNumber = null,
     ): void {
         if ($conversationId === null) return;
 
-        DB::transaction(function () use ($conversationId, $intent, $multiIntent, $turnId): void {
+        DB::transaction(function () use ($conversationId, $intent, $multiIntent, $turnId, $outcomeSignal, $invoiceNumber): void {
             $messageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $conversationId)
                 ->where('role', 'assistant')
@@ -428,9 +461,9 @@ class AgentDispatcherService
             $meta['intent']       = $intent;
             $meta['multi_intent'] = $multiIntent;
 
-            if ($turnId !== null) {
-                $meta['turn_id'] = $turnId;  // ← store it
-            }
+            if ($turnId !== null)        $meta['turn_id']        = $turnId;
+            if ($outcomeSignal !== null)  $meta['outcome']        = $outcomeSignal;
+            if ($invoiceNumber !== null)  $meta['invoice_number'] = $invoiceNumber;
 
             DB::table('agent_conversation_messages')
                 ->where('id', $messageRow->id)
@@ -438,15 +471,9 @@ class AgentDispatcherService
         });
     }
 
-    /**
-     * Build a domain-specific error message for the user.
-     * Never exposes internal details or stack traces.
-     * Reads labels from AgentRegistry keys — no hardcoded list.
-     */
     private function errorResponse(string $intent): string
     {
         $label = ucfirst($intent);
-
         return "I encountered an issue with {$label} operations. Please try again in a moment. "
             . "If the problem persists, please contact support.";
     }

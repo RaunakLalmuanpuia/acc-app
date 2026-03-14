@@ -14,23 +14,6 @@ use Laravel\Ai\Attributes\Provider;
 use Laravel\Ai\Attributes\Temperature;
 use Laravel\Ai\Enums\Lab;
 
-/**
- * InventoryAgent  (v3 — extends BaseAgent)
- *
- * Specialist for products and services.
- * Owns: browsing, filtering, creating, updating, and deleting inventory items.
- *
- * BaseAgent automatically injects:
- *   - Header (agent identity + today's date)
- *   - PLAN FIRST / ReWOO block
- *   - LOOP GUARD block
- *   - DESTRUCTIVE OPERATIONS / HITL awareness block
- *
- * REFERENCE_ONLY: item names are referenced by InvoiceAgent via get_inventory.
- * Mentioning a product name inside an invoice request must NOT trigger a
- * standalone InventoryAgent dispatch — the RouterAgent suppresses this
- * automatically because REFERENCE_ONLY is declared here.
- */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
 #[MaxSteps(10)]
@@ -67,51 +50,68 @@ class InventoryAgent extends BaseAgent
         • Present inventory in a table: name, category, unit, rate, stock qty.
         • For low-stock queries, highlight items below the reorder threshold.
 
+        // In InventoryAgent::domainInstructions() — replace CREATING AN ITEM:
+
         ═════════════════════════════════════════════════════════════════════════
         CREATING AN ITEM
         ═════════════════════════════════════════════════════════════════════════
 
         1. SEARCH FIRST — Call get_inventory with the item name.
-           • Found    → show the existing record. Ask: "This item already exists —
-             do you want to update it instead?"
-           • Not found → proceed to gather missing fields.
+           • Found    → show the existing record and ask if user wants to update.
+           • Not found → proceed to step 2.
 
-        2. GATHER GAPS (in one message) — Required fields:
-           • Name (required)
-           • Category (required)
-           • Unit of measure — e.g. pcs, kg, hr (required)
-           • Selling rate in ₹ (required)
-           • GST rate % (required)
-           • HSN/SAC code (optional but recommended for GST invoicing)
-           • Opening stock quantity (optional)
+        2. GATHER ONE FIELD ONLY — The only field you ever ask for is the rate.
+           Everything else is inferred automatically. Never ask for brand,
+           description, cost price, MRP, stock quantity, or low stock threshold
+           — these are optional and can be updated later.
 
-        3. CONFIRM — Show all collected fields and ask the user to confirm.
+           INFER these defaults silently (show them, do not ask):
+             "chairs", "tables", "desks", "sofa"   → Category: Furniture,   Unit: pcs, GST: 18%
+             "laptop", "phone", "TV", "computer"   → Category: Electronics, Unit: pcs, GST: 18%
+             "consulting", "design", "dev", "audit"→ Category: Services,    Unit: hr,  GST: 18%
+             "paper", "pens", "files"              → Category: Stationery,  Unit: pcs, GST: 12%
+             anything else                         → Category: General,     Unit: pcs, GST: 18%
 
-        4. CREATE — Call create_inventory_item.
+           Show inferred defaults and ask ONLY for rate:
+           "I'll set: Category: Furniture · Unit: pcs · GST: 18%
+           What's the selling rate per chair (₹)?"
+
+           RATE PARSING — the rate may already be in the user's message:
+           • A standalone number that is NOT a 10-digit phone and NOT an email → rate.
+           • Examples: "200", "₹500", "1,200" → rate. Accept immediately, skip asking.
+           • "7640876052, xyz@mail.com, 200" → phone=7640876052, email=xyz@mail.com,
+             rate=200. Do NOT ask for rate again.
+
+           CRITICAL — when part of an invoice request, end reply with:
+           "⏳ Once I have the rate, I'll add it to your inventory and your invoice will proceed."
+
+        3. CONFIRM STEP — SKIP when in a multi-agent turn AND rate is already known.
+           Call create_inventory_item IMMEDIATELY. No confirmation table.
+
+        4. CREATE — Call create_inventory_item with:
+           • name, rate, category, unit, gst_rate (from inferred defaults + supplied rate)
+           • Nothing else unless the user explicitly provided it.
+           Reply with ONLY: "✅ [Name] added to inventory at ₹[rate]/[unit]."
 
         ═════════════════════════════════════════════════════════════════════════
         UPDATING AN ITEM
         ═════════════════════════════════════════════════════════════════════════
 
-        1. SEARCH FIRST — Call get_inventory to locate the record by name.
-           If multiple matches, list them and ask which one to update.
-
+        1. SEARCH FIRST — Call get_inventory to locate the record.
+           If multiple matches, list them and ask which one.
         2. SHOW CHANGES — Present current values alongside proposed changes.
-
         3. CONFIRM — "Shall I update [field] from [old] to [new]?"
-
-        4. UPDATE — Call update_inventory_item only after an explicit yes.
+        4. UPDATE — Call update_inventory_item only after explicit yes.
 
         ═════════════════════════════════════════════════════════════════════════
         DELETING AN ITEM
         ═════════════════════════════════════════════════════════════════════════
 
-        The HITL checkpoint (handled upstream) will have intercepted this before
-        this agent is called. When the ✅ HITL PRE-AUTHORIZED block is present,
-        call get_inventory first to confirm the correct record, then delete.
+        The HITL checkpoint (handled upstream) will have intercepted this.
+        When the ✅ HITL PRE-AUTHORIZED block is present, call get_inventory
+        first to confirm the correct record, then delete.
 
-        Always warn if the item is referenced in existing invoices — the tool
-        response will indicate this. Inform the user before proceeding.
+        Always warn if the item is referenced in existing invoices.
 
         ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR
