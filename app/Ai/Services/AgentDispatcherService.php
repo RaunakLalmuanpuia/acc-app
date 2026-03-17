@@ -161,10 +161,40 @@ class AgentDispatcherService
                 hitlConfirmed: $hitlConfirmed,
             );
 
-            $response = $agent->prompt(
-                prompt:      $prompt,
-                attachments: $attachments,
-            );
+            $response  = null;
+            $attempts  = 0;
+            $maxTries  = 5;
+            $baseDelay = 2; // seconds
+
+            while ($attempts < $maxTries) {
+                try {
+                    $response = $agent->prompt(
+                        prompt:      $prompt,
+                        attachments: $attachments,
+                    );
+                    break; // success — exit retry loop
+                } catch (\Throwable $e) {
+                    $attempts++;
+                    $isRateLimit = str_contains($e->getMessage(), 'rate limit')
+                        || str_contains($e->getMessage(), 'RateLimited')
+                        || str_contains($e->getMessage(), 'rate_limit_exceeded')
+                        || ($e instanceof \Laravel\Ai\Exceptions\RateLimitedException);
+
+                    if ($isRateLimit && $attempts < $maxTries) {
+                        $delay = $baseDelay * (2 ** ($attempts - 1)); // 2s, 4s
+                        Log::warning("[AgentDispatcherService] Rate limited — retrying in {$delay}s", [
+                            'intent'   => $intent,
+                            'attempt'  => $attempts,
+                            'max'      => $maxTries,
+                        ]);
+                        sleep($delay);
+                        continue;
+                    }
+
+                    // Non-rate-limit error or exhausted retries — rethrow to outer catch
+                    throw $e;
+                }
+            }
 
             $latencyMs = (int) ((microtime(true) - $start) * 1000);
 
