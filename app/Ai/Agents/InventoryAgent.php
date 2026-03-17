@@ -50,14 +50,18 @@ class InventoryAgent extends BaseAgent
         • Present inventory in a table: name, category, unit, rate, stock qty.
         • For low-stock queries, highlight items below the reorder threshold.
 
-        // In InventoryAgent::domainInstructions() — replace CREATING AN ITEM:
 
         ═════════════════════════════════════════════════════════════════════════
         CREATING AN ITEM
         ═════════════════════════════════════════════════════════════════════════
 
         1. SEARCH FIRST — Call get_inventory with the item name.
-           • Found    → show the existing record and ask if user wants to update.
+           • Found + standalone request → show the existing record and ask if user wants to update.
+           • Found + multi-agent turn (PRIOR AGENT CONTEXT block is present)
+             → Reply with ONLY:
+               "✅ [Name] found in inventory at ₹[rate]/[unit]."
+               [INVENTORY_ITEM_ID:{numeric id from get_inventory result}]
+               Then output NOTHING else. Do NOT ask if the user wants to update.
            • Not found → proceed to step 2.
 
         2. GATHER ONE FIELD ONLY — The only field you ever ask for is the rate.
@@ -92,6 +96,9 @@ class InventoryAgent extends BaseAgent
            • name, rate, category, unit, gst_rate (from inferred defaults + supplied rate)
            • Nothing else unless the user explicitly provided it.
            Reply with ONLY: "✅ [Name] added to inventory at ₹[rate]/[unit]."
+           Then on the very next line output EXACTLY (no markdown, no spaces):
+            [INVENTORY_ITEM_ID:{numeric id returned by create_inventory_item}]
+            Then output NOTHING else.
 
         ═════════════════════════════════════════════════════════════════════════
         UPDATING AN ITEM

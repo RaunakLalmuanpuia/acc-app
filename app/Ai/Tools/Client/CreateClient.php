@@ -45,7 +45,7 @@ class CreateClient implements Tool
             'pan_number'    => $schema->string(),
             'gst_type'      => $schema->string()->enum(['regular', 'composition', 'unregistered', 'sez', 'overseas']),
             'email'         => $schema->string(),
-            'phone'         => $schema->string()->required(),
+            'phone'         => $schema->string(),
             'address'       => $schema->string(),
             'city'          => $schema->string(),
             'pincode'       => $schema->string(),

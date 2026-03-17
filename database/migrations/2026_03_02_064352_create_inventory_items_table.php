@@ -43,7 +43,7 @@ return new class extends Migration
             $table->timestamps();
             $table->softDeletes();
 
-            $table->unique(['company_id', 'sku']);
+//            $table->unique(['company_id', 'sku']);
             $table->index(['company_id', 'name']);
             $table->index('hsn_code');
             $table->index('category');

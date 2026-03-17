@@ -87,7 +87,15 @@ class AgentDispatcherService
             );
 
             $results[$intent] = $result;
-            $blackboard->record($intent, $result['reply']);
+
+            $rawReply   = $result['reply'];
+            $cleanReply = preg_replace('/\[(CLIENT_ID|INVENTORY_ITEM_ID):\d+\]\n?/', '', $rawReply);
+
+            $result['reply']          = $cleanReply;
+            $results[$intent]['reply'] = $cleanReply;
+
+            $blackboard->record($intent, $cleanReply);
+            $this->attachStructuredContext($intent, $rawReply, $blackboard); // raw, so regex finds the tags
 
             if ($index === 0 && $baseConversationId === null && !($result['_error'] ?? false)) {
                 $rawId = $result['conversation_id'] ?? null;
@@ -476,5 +484,22 @@ class AgentDispatcherService
         $label = ucfirst($intent);
         return "I encountered an issue with {$label} operations. Please try again in a moment. "
             . "If the problem persists, please contact support.";
+    }
+    private function attachStructuredContext(
+        string                 $intent,
+        string                 $reply,
+        AgentContextBlackboard $blackboard,
+    ): void {
+        if ($intent === 'client') {
+            if (preg_match('/\[CLIENT_ID:(\d+)\]/', $reply, $m)) {
+                $blackboard->setMeta('client_id', (int) $m[1]);
+            }
+        }
+
+        if ($intent === 'inventory') {
+            if (preg_match('/\[INVENTORY_ITEM_ID:(\d+)\]/', $reply, $m)) {
+                $blackboard->setMeta('inventory_item_id', (int) $m[1]);
+            }
+        }
     }
 }

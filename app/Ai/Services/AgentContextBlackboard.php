@@ -34,6 +34,8 @@ class AgentContextBlackboard
      */
     private array $state = [];
 
+    private array $meta = [];
+
     /**
      * Record a completed agent's reply onto the blackboard.
      *
@@ -70,6 +72,17 @@ class AgentContextBlackboard
     public function getReply(string $intent): ?string
     {
         return $this->state[$intent]['reply'] ?? null;
+    }
+
+    // Add these two methods after getReply():
+    public function setMeta(string $key, mixed $value): void
+    {
+        $this->meta[$key] = $value;
+    }
+
+    public function getMeta(string $key, mixed $default = null): mixed
+    {
+        return $this->meta[$key] ?? $default;
     }
 
     /**
@@ -109,11 +122,30 @@ class AgentContextBlackboard
             '',
         ];
 
+
         foreach ($priorIntents as $intent) {
             $lines[] = "── [{$intent} agent completed] ──────────────────────────────────";
             $lines[] = $this->state[$intent]['reply'];
             $lines[] = "── [end {$intent} context] ──────────────────────────────────────";
             $lines[] = '';
+        }
+
+        // Add after the foreach loop, before the closing lines:
+        if ($forIntent === 'invoice') {
+            $clientId = $this->getMeta('client_id');
+            $itemId   = $this->getMeta('inventory_item_id');
+
+            if ($clientId || $itemId) {
+                $lines[] = '── [resolved IDs — use directly, skip lookup tools] ────────────';
+                if ($clientId) {
+                    $lines[] = "⚙ client_id = {$clientId} → pass directly to create_invoice. Do NOT call lookup_client.";
+                }
+                if ($itemId) {
+                    $lines[] = "⚙ inventory_item_id = {$itemId} → pass directly to add_line_item. Do NOT call lookup_inventory_item.";
+                }
+                $lines[] = '── [end resolved IDs] ───────────────────────────────────────────';
+                $lines[] = '';
+            }
         }
 
         $lines[] = '════════════════════════════════════════════════════════════════';

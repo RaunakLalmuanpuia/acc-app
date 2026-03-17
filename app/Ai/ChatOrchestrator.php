@@ -158,6 +158,13 @@ class ChatOrchestrator
     ): array {
         $turnStart = microtime(true);
 
+        // ↓ ADD THESE THREE LINES
+        $turnId = Str::uuid()->toString();
+        $this->observability->setTurnId($turnId);
+        $this->activeInvoiceNumber = null;
+
+
+
         $action = $this->hitl->consumePendingAction($pendingId);
 
         if ($action === null) {
@@ -198,6 +205,7 @@ class ChatOrchestrator
             intents:        $action['intents'],
             attachments:    $attachments,
             turnStart:      $turnStart,
+            turnId:         $turnId,
             hitlConfirmed:  true,
         );
     }

@@ -54,7 +54,6 @@ class ClientAgent extends BaseAgent
 
         2. GATHER GAPS — Minimum viable to create:
            • Full name  (required — already provided if user named the client)
-           • Phone      (required)
            • Email      (required)
 
            Collect only what is MISSING. Ask for ONLY the missing required
@@ -85,7 +84,9 @@ class ClientAgent extends BaseAgent
            INVOICE WORKFLOW: If the original user message mentioned an invoice,
            end your reply with EXACTLY:
            "✅ Client created. Proceeding to create your invoice now."
-           Then output NOTHING else — no questions, no optional field prompts.
+            Then on the very next line output EXACTLY (no markdown, no spaces):
+            [CLIENT_ID:{numeric id returned by create_client}]
+            Then output NOTHING else.
 
         ── ALREADY CREATED / HANDOFF ─────────────────────────────────────────
 
