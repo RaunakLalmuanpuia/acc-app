@@ -387,8 +387,15 @@ class InvoiceAgentService
         $pdf  = Pdf::loadView('invoices.pdf', ['invoice' => $invoice])
             ->setPaper('a4', 'portrait');
 
-        $path = "invoices/{$invoice->invoice_number}.pdf";
-        Storage::disk('local')->put($path, $pdf->output());
+        $disk = Storage::disk('local'); // storage/app/private/ in L11
+        $disk->makeDirectory('invoices');
+
+        $path    = "invoices/{$invoice->invoice_number}.pdf";
+        $written = $disk->put($path, $pdf->output());
+
+        if (! $written) {
+            throw new \RuntimeException("Failed to write PDF at [{$path}].");
+        }
 
         $invoice->update(['pdf_path' => $path]);
 

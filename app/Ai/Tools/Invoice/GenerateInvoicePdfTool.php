@@ -36,6 +36,12 @@ class GenerateInvoicePdfTool implements Tool
 
             return json_encode(['success' => true, ...$result]);
         } catch (\Throwable $e) {
+            \Log::error('[GenerateInvoicePdfTool] Tool execution failed', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            // ↓ Must return string, not array
             return json_encode(['error' => $e->getMessage()]);
         }
     }
