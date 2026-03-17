@@ -3,23 +3,29 @@
 namespace App\Ai\Services;
 
 /**
- * ResponseMergerService
+ * ResponseMergerService  (v2 — HANDOFF suppression + pending signal consolidation)
  *
- * Merges the responses from one or more specialist agents into a single
- * coherent reply for the user.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v1
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * Rules:
- *  - Single intent → return the response as-is (no decoration).
- *  - Multi-intent  → combine with labelled emoji section headers.
- *  - Empty / unknown only → return a helpful static fallback at zero AI cost.
+ * HANDOFF suppression:
+ *   ClientAgent replies with the single word "HANDOFF" when it has nothing
+ *   useful to add (client already created, user said "proceed"). This is
+ *   filtered out before merging so the user only sees the invoice reply.
+ *
+ * Pending signal consolidation:
+ *   When gather-phase agents (client, inventory) reply with ⏳ pending signals,
+ *   InvoiceAgent replies with a short "waiting" sentence. The merger strips
+ *   InvoiceAgent's waiting reply and appends a single consolidated ⏳ footer
+ *   so the user sees one clear call-to-action instead of three separate sections.
+ *
+ * Single-content shortcut:
+ *   After filtering HANDOFF and invoice-waiting replies, if only one agent
+ *   has real content, return it without section headers.
  */
 class ResponseMergerService
 {
-    /**
-     * Fallback reply when no valid domain intents were resolved.
-     * Returned verbatim — no AI agent is invoked, meaning zero gpt-4o cost
-     * for greetings, thank-yous, and out-of-scope messages.
-     */
     private const UNKNOWN_RESPONSE =
         "I'm your accounting assistant. I can help you with:\n\n"
         . "• 🧾 **Invoices** — create, confirm, view, or generate PDFs\n"
@@ -30,41 +36,34 @@ class ResponseMergerService
         . "• 🏦 **Bank Transactions** — review, categorise, reconcile transactions\n\n"
         . "How can I help you today?";
 
-    /** Emoji labels per domain for multi-intent merged replies. */
     private const SECTION_LABELS = [
-        'invoice'   => '🧾 Invoice',
-        'client'    => '👤 Client',
-        'inventory' => '📦 Inventory',
-        'narration' => '📒 Narration Heads',
-        'business'  => '🏢 Business Profile',
+        'invoice'          => '🧾 Invoice',
+        'client'           => '👤 Client',
+        'inventory'        => '📦 Inventory',
+        'narration'        => '📒 Narration Heads',
+        'business'         => '🏢 Business Profile',
         'bank_transaction' => '🏦 Bank Transactions',
     ];
 
-    /**
-     * Produce the final reply string from a map of intent → response.
-     *
-     * @param  array<string, string> $responses  Keyed by intent.
-     * @return string
-     */
     public function merge(array $responses): string
     {
+        // Strip HANDOFF signals — client handoff markers, not user-facing
+        $responses = array_filter(
+            $responses,
+            fn($r) => trim($r) !== 'HANDOFF'
+        );
+
         if (empty($responses)) {
-            return self::UNKNOWN_RESPONSE;
+            return '';
         }
 
-        // Single specialist → return as-is, clean and undecorated
         if (count($responses) === 1) {
             return reset($responses);
         }
 
-        // Multiple specialists → combine with clear section headers
         return $this->mergeMultiple($responses);
     }
 
-    /**
-     * Return the static unknown/fallback response.
-     * Called by the orchestrator when no valid domain intents are found.
-     */
     public function unknownResponse(): string
     {
         return self::UNKNOWN_RESPONSE;
@@ -72,22 +71,73 @@ class ResponseMergerService
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    /**
-     * Combine multiple specialist responses into one readable reply.
-     *
-     * Each section is labelled with a markdown heading and separated by a
-     * horizontal rule so the user can clearly see which part of their request
-     * each response addresses.
-     */
     private function mergeMultiple(array $responses): string
     {
-        $parts = [];
+        $contentParts     = [];
+        $hasPendingSignal = false;
+        $hasError         = false;
 
         foreach ($responses as $intent => $reply) {
-            $label   = self::SECTION_LABELS[$intent] ?? ucfirst($intent);
-            $parts[] = "### {$label}\n\n{$reply}";
+            $label = self::SECTION_LABELS[$intent] ?? ucfirst($intent);
+
+            if ($intent === 'invoice' && $this->isInvoiceWaiting($reply)) {
+                continue;
+            }
+
+            // Detect error replies — suppress them from the merged output
+            // when other agents succeeded. We'll add a unified retry message.
+            if ($this->isErrorReply($reply)) {
+                $hasError = true;
+                continue;
+            }
+
+            if (str_contains($reply, '⏳')) {
+                $hasPendingSignal = true;
+            }
+
+            $cleanReply     = $this->stripPendingSignal($reply);
+            $contentParts[] = "### {$label}\n\n{$cleanReply}";
         }
 
-        return implode("\n\n---\n\n", $parts);
+        if (empty($contentParts) && $hasError) {
+            return "I'm processing a lot right now — please send your message again in a few seconds.";
+        }
+
+        if (empty($contentParts)) {
+            return "I'll create the invoice once the details above are confirmed.";
+        }
+
+        $merged = count($contentParts) === 1
+            ? ltrim(preg_replace('/^### [^\n]+\n\n/', '', reset($contentParts)))
+            : implode("\n\n---\n\n", $contentParts);
+
+        if ($hasPendingSignal) {
+            $merged .= "\n\n---\n\n⏳ **Once I have these details, I'll create both records and generate your invoice automatically.**";
+        }
+
+        // If invoice failed but client/inventory succeeded, prompt retry
+        if ($hasError) {
+            $merged .= "\n\n---\n\n⚠️ The invoice step hit a rate limit. Your client and inventory were saved — **please send your message again** to complete the invoice.";
+        }
+
+        return $merged;
+    }
+
+    private function isErrorReply(string $reply): bool
+    {
+        return str_contains($reply, 'I encountered an issue')
+            || str_contains($reply, 'please try again in a moment')
+            || str_contains($reply, 'processing a lot right now');
+    }
+
+    private function isInvoiceWaiting(string $reply): bool
+    {
+        $lower = strtolower(trim($reply));
+        return str_contains($lower, "once the") && str_contains($lower, "i'll proceed");
+    }
+
+    private function stripPendingSignal(string $reply): string
+    {
+        return trim(preg_replace('/\n?⏳[^\n]+/', '', $reply));
     }
 }
