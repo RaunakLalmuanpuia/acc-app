@@ -64,11 +64,11 @@ class AgentRegistry
      * @var array<string, string>
      */
     public const AGENT_MODELS = [
-        'invoice'   => 'gpt-4o',
-        'client'    => 'gpt-4o',
-        'inventory' => 'gpt-4o',
-        'narration' => 'gpt-4o',
-        'business'  => 'gpt-4o',
+        'invoice'          => 'gpt-4o',
+        'client'           => 'gpt-4o',
+        'inventory'        => 'gpt-4o',
+        'narration'        => 'gpt-4o-mini',
+        'business'         => 'gpt-4o-mini',
         'bank_transaction' => 'gpt-4o',
     ];
 

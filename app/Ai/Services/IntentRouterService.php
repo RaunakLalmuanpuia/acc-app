@@ -144,8 +144,8 @@ class IntentRouterService
     {
         try {
             $response = $this->router->prompt(prompt: $message);
-            $decoded = json_decode(trim((string) $response), true);
-            return $decoded['intents'] ?? [];
+            $intents  = $this->parseIntents(trim((string) $response));
+            return $this->filterValid($intents);
         } catch (\Throwable $e) {
             Log::error('[IntentRouterService] RouterAgent call failed', [
                 'error' => $e->getMessage(),

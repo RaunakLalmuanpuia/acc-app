@@ -60,6 +60,32 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
 
     public function __construct(public readonly User $user) {}
 
+
+    // ── Conversation history ───────────────────────────────────────────────────
+
+    /**
+     * Cap conversation history to the last 10 messages (5 user+assistant pairs).
+     *
+     * The SDK default is 100. On a 10-turn session each agent's scoped
+     * conversation ({id}:invoice, {id}:client etc.) replays up to 100
+     * messages worth of tokens on every single API call.
+     *
+     * 10 is sufficient because:
+     *  - Each agent has its own scoped conversation — history is already
+     *    domain-isolated, so there is no cross-agent noise to retain.
+     *  - The last 5 exchanges contain all the context the agent needs
+     *    to continue the current task.
+     *  - Earlier turns are already acted upon (client created, item added,
+     *    draft confirmed). Replaying them costs tokens but contributes nothing.
+     *
+     * Raise this on a per-agent basis by overriding this method in the
+     * subclass only — do not raise the global default.
+     */
+    protected function maxConversationMessages(): int
+    {
+        return 10;
+    }
+
     // ── Abstract — every subclass must implement ───────────────────────────────
 
     /**
@@ -123,18 +149,34 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         $userName = $this->user->name;
         $domain   = $this->domainLabel();
 
+        // ── Static blocks first ────────────────────────────────────────────────
+        // OpenAI caches prompt prefixes that are identical across requests.
+        // Cached input tokens cost 50% less (gpt-4o: $2.50 → $1.25 per 1M).
+        //
+        // Rule: anything that never changes within a user session goes first.
+        // Anything volatile (today's date, user name) goes last so it does
+        // not bust the cached prefix.
+        //
+        // These blocks are identical for every user on the same agent class:
         $blocks = [
-            $this->headerBlock($userName, $today, $domain),
-            $this->scopeDeclarationBlock(),
-            $this->planningInstructions(),
-            $this->loopGuardInstructions(),
+            $this->scopeDeclarationBlock(),     // pure static text
+            $this->planningInstructions(),      // pure static text
+            $this->loopGuardInstructions(),     // pure static text
         ];
 
         if ($this->hasCapability(AgentCapability::DESTRUCTIVE)) {
-            $blocks[] = $this->destructiveInstructions();
+            $blocks[] = $this->destructiveInstructions(); // pure static text
         }
 
+        // Domain instructions are semi-static — they change only when the
+        // agent class itself changes, not per-user or per-turn.
         $blocks[] = $this->domainInstructions();
+
+        // ── Volatile block last ────────────────────────────────────────────────
+        // Header contains today's date and the user's name — changes daily
+        // and per-user. Placing it last means the ~1500-token static prefix
+        // above is never invalidated by these values changing.
+        $blocks[] = $this->headerBlock($userName, $today, $domain);
 
         return implode("\n\n", array_filter($blocks));
     }

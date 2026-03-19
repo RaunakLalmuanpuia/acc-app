@@ -31,9 +31,9 @@ use Laravel\Ai\Enums\Lab;
  *   - DESTRUCTIVE OPERATIONS / HITL awareness block
  */
 #[Provider(Lab::OpenAI)]
-#[Model('gpt-4o')]
-#[MaxSteps(15)]
-#[MaxTokens(2500)]
+#[Model('gpt-4o-mini')]
+#[MaxSteps(8)]
+#[MaxTokens(1200)]
 #[Temperature(0.1)]
 class NarrationAgent extends BaseAgent
 {

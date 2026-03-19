@@ -20,7 +20,7 @@ class CreateClient implements Tool
 
     public function description(): Stringable|string
     {
-        return 'Create a new client/customer. Name, state, and state_code are required. '
+        return 'Create a new client/customer. Name, email, and phone are required. '
             . 'Returns the new client\'s ID and name.';
     }
 

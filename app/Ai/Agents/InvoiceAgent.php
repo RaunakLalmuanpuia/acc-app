@@ -21,7 +21,7 @@ use Laravel\Ai\Enums\Lab;
 
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(30)]
+#[MaxSteps(15)]
 #[MaxTokens(3000)]
 #[Temperature(0.1)]
 class InvoiceAgent extends BaseAgent

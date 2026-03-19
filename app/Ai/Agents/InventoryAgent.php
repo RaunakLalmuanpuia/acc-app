@@ -16,7 +16,7 @@ use Laravel\Ai\Enums\Lab;
 
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(10)]
+#[MaxSteps(5)]
 #[MaxTokens(2000)]
 #[Temperature(0.1)]
 class InventoryAgent extends BaseAgent

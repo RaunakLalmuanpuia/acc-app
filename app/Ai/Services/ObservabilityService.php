@@ -65,8 +65,8 @@ class ObservabilityService
      * Update when OpenAI pricing changes.
      */
     private const MODEL_COSTS = [
-        'gpt-4o'      => ['input' => 0.005,   'output' => 0.015],
-        'gpt-4o-mini' => ['input' => 0.00015, 'output' => 0.0006],
+        'gpt-4o'      => ['input' => 0.0025,   'cached' => 0.00125,   'output' => 0.010],
+        'gpt-4o-mini' => ['input' => 0.00015,  'cached' => 0.000075,  'output' => 0.0006],
     ];
 
     /**
@@ -111,7 +111,11 @@ class ObservabilityService
             ? 'error'
             : (in_array($outcomeSignal, self::OUTCOME_SIGNALS, true) ? $outcomeSignal : null);
 
-        $estimatedCostUsd = $this->estimateCost($model, $inputTokens, $outputTokens);
+        $inputTokens  = $usageData['prompt_tokens']          ?? null;
+        $outputTokens = $usageData['completion_tokens']       ?? null;
+        $cachedTokens = $usageData['cache_read_input_tokens'] ?? null; // ← add this
+
+        $estimatedCostUsd = $this->estimateCost($model, $inputTokens, $outputTokens, $cachedTokens);
 
         $metric = [
             'intent'             => $intent,
@@ -233,6 +237,7 @@ class ObservabilityService
         string $model,
         ?int   $inputTokens,
         ?int   $outputTokens,
+        ?int   $cachedTokens = null,
     ): float {
         $rates = self::MODEL_COSTS[$model] ?? null;
 
@@ -240,8 +245,14 @@ class ObservabilityService
             return 0.0;
         }
 
+        // cached tokens are billed at 50% — already included in inputTokens count
+        // so we subtract them from full-rate billing and add them at half-rate
+        $cached      = $cachedTokens ?? 0;
+        $nonCached   = max(0, $inputTokens - $cached);
+
         return round(
-            ($inputTokens  / 1000 * $rates['input']) +
+            ($nonCached / 1000 * $rates['input'])  +
+            ($cached    / 1000 * $rates['cached']) +
             ($outputTokens / 1000 * $rates['output']),
             6
         );

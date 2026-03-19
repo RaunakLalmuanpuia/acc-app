@@ -67,11 +67,6 @@ class AgentDispatcherService
         $baseConversationId = $conversationId;
 
         foreach ($intents as $index => $intent) {
-            // Small pause between sequential agent calls to avoid rate limiting.
-            // Skip on the first call — no need to delay before we start.
-            if ($index > 0) {
-                usleep(300_000); // 300ms
-            }
 
             $result = $this->dispatch(
                 intent:              $intent,

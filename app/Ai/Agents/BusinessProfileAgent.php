@@ -33,9 +33,9 @@ use Laravel\Ai\Enums\Lab;
  * the narration setup wizard (NarrationAgent handles the actual creation).
  */
 #[Provider(Lab::OpenAI)]
-#[Model('gpt-4o')]
-#[MaxSteps(8)]
-#[MaxTokens(1500)]
+#[Model('gpt-4o-mini')]
+#[MaxSteps(4)]
+#[MaxTokens(800)]
 #[Temperature(0.1)]
 class BusinessProfileAgent extends BaseAgent
 {

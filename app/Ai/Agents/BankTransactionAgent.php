@@ -49,7 +49,7 @@ use Laravel\Ai\Enums\Lab;
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(20)]
+#[MaxSteps(12)]
 #[MaxTokens(3000)]
 #[Temperature(0.1)]
 class BankTransactionAgent extends BaseAgent
