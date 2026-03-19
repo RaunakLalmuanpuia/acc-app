@@ -48,8 +48,14 @@ class ClientAgent extends BaseAgent
         ── CREATING A CLIENT ─────────────────────────────────────────────────
 
         1. SEARCH FIRST — Call get_clients with the name the user provided.
-           • Found    → show the existing record. Ask: "A client with this name
-             already exists — do you want to update them instead?"
+           • Found + standalone request → show the existing record.
+             Ask: "A client with this name already exists — do you want to update them instead?"
+           • Found + invoice workflow (original user message mentioned an invoice)
+             → Reply with:
+               "✅ Using existing client [Name]. Proceeding to create your invoice now."
+               Then on the very next line output EXACTLY (no markdown, no spaces):
+               [CLIENT_ID:{numeric id from get_clients result}]
+               Then output NOTHING else.
            • Not found → proceed to gather missing fields.
 
         2. GATHER GAPS — Minimum viable to create:

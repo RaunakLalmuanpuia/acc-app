@@ -4,12 +4,80 @@ import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import {
     Send, Sparkles, Paperclip, X, AlertCircle, Loader2, Copy, Check,
     FileText, Users, Package, Building, Download, AlertTriangle,
-    CheckCircle2, XCircle,ArrowLeftRight
+    CheckCircle2, XCircle, ArrowLeftRight, Plus,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-// ─── HITL Confirmation Card ────────────────────────────────────────────────
+// ─── Conversation persistence helpers ─────────────────────────────────────────
+//
+// Stores message history and conversation_id in localStorage so the chat
+// survives Inertia full-reload fallbacks (session expiry, 500 errors, etc.)
+// and accidental page refreshes.
+//
+// Each value is wrapped in try/catch — private/incognito mode may block
+// localStorage writes. The app degrades gracefully: state is lost on refresh
+// but nothing throws.
+
+const STORAGE_KEY_MESSAGES        = 'accounting_chat_messages';
+const STORAGE_KEY_CONVERSATION_ID = 'accounting_chat_conversation_id';
+
+function loadPersistedMessages() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY_MESSAGES);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length === 0) return null;
+        // Strip HITL state — a pending confirmation cannot survive a reload
+        // because the HITL cache entry may have expired (15-minute TTL).
+        // Mark the HITL message as cancelled so it renders as a plain bubble.
+        return parsed.map(msg => ({
+            ...msg,
+            isHitl:    false,
+            cancelled: msg.isHitl ? true : (msg.cancelled ?? false),
+        }));
+    } catch {
+        return null;
+    }
+}
+
+function loadPersistedConversationId() {
+    try {
+        return localStorage.getItem(STORAGE_KEY_CONVERSATION_ID) || null;
+    } catch {
+        return null;
+    }
+}
+
+function persistMessages(messages) {
+    try {
+        localStorage.setItem(STORAGE_KEY_MESSAGES, JSON.stringify(messages));
+    } catch {}
+}
+
+function persistConversationId(id) {
+    try {
+        if (id) {
+            localStorage.setItem(STORAGE_KEY_CONVERSATION_ID, id);
+        }
+    } catch {}
+}
+
+function clearPersistedConversation() {
+    try {
+        localStorage.removeItem(STORAGE_KEY_MESSAGES);
+        localStorage.removeItem(STORAGE_KEY_CONVERSATION_ID);
+    } catch {}
+}
+
+// ─── Welcome message (single source of truth) ─────────────────────────────────
+const WELCOME_MESSAGE = {
+    id:      'welcome',
+    role:    'assistant',
+    content: "Hello! I'm your AI accounting assistant. How can I help you today?",
+};
+
+// ─── HITL Confirmation Card ────────────────────────────────────────────────────
 function HitlConfirmCard({ warningText, pendingId, onConfirm, onCancel, isConfirming }) {
     const fileInputRef = useRef(null);
     const [attachments, setAttachments] = useState([]);
@@ -35,11 +103,12 @@ function HitlConfirmCard({ warningText, pendingId, onConfirm, onCancel, isConfir
                 </div>
 
                 <div className="px-4 py-3 text-sm text-gray-700 markdown-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}
-                                   components={{
-                                       p: ({node, ...props}) => <p className="mb-2 last:mb-0" {...props} />,
-                                       strong: ({node, ...props}) => <strong className="font-semibold text-gray-900" {...props} />,
-                                   }}
+                    <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                            p: ({ node, ...props }) => <p className="mb-2 last:mb-0" {...props} />,
+                            strong: ({ node, ...props }) => <strong className="font-semibold text-gray-900" {...props} />,
+                        }}
                     >
                         {warningText}
                     </ReactMarkdown>
@@ -104,7 +173,7 @@ function HitlConfirmCard({ warningText, pendingId, onConfirm, onCancel, isConfir
     );
 }
 
-// ─── Main Chat Component ───────────────────────────────────────────────────
+// ─── Main Chat Component ───────────────────────────────────────────────────────
 export default function Chat() {
     const { auth, errors } = usePage().props;
 
@@ -112,13 +181,13 @@ export default function Chat() {
     const fileInputRef = useRef(null);
     const textareaRef  = useRef(null);
 
-    const [localMessages, setLocalMessages] = useState([
-        {
-            id:      'welcome',
-            role:    'assistant',
-            content: "Hello! I'm your AI accounting assistant. How can I help you today?",
-        }
-    ]);
+    // ── Initialise from localStorage if available ──────────────────────────
+    // useState lazy initialisers run once on mount — safe to call localStorage here.
+    const [localMessages, setLocalMessages] = useState(() => {
+        const persisted = loadPersistedMessages();
+        if (persisted && persisted.length > 0) return persisted;
+        return [WELCOME_MESSAGE];
+    });
 
     const [hitlState, setHitlState] = useState({
         active:    false,
@@ -140,9 +209,10 @@ export default function Chat() {
 
     const [copiedId, setCopiedId] = useState(null);
 
+    // ── Initialise conversation_id from localStorage ───────────────────────
     const { data, setData, post, processing, reset, clearErrors } = useForm({
         message:         '',
-        conversation_id: null,
+        conversation_id: loadPersistedConversationId(),
         attachments:     [],
     });
 
@@ -152,27 +222,39 @@ export default function Chat() {
         if (!response?.reply) return;
 
         if (response.hitl_pending) {
-            setLocalMessages(prev => [...prev, {
-                id:        Date.now(),
-                role:      'assistant',
-                content:   response.reply,
-                isHitl:    true,
-                pendingId: response.pending_id,
-            }]);
+            setLocalMessages(prev => {
+                const updated = [...prev, {
+                    id:        Date.now(),
+                    role:      'assistant',
+                    content:   response.reply,
+                    isHitl:    true,
+                    pendingId: response.pending_id,
+                }];
+                persistMessages(updated);
+                return updated;
+            });
             setHitlState({ active: true, pendingId: response.pending_id });
         } else {
             // Normal reply OR successful confirm — clear HITL gate
             setHitlState({ active: false, pendingId: null });
             setConfirming(false);
-            setLocalMessages(prev => [...prev, {
-                id:      Date.now(),
-                role:    'assistant',
-                content: response.reply,
-            }]);
+            setLocalMessages(prev => {
+                const updated = [...prev, {
+                    id:      Date.now(),
+                    role:    'assistant',
+                    content: response.reply,
+                }];
+                persistMessages(updated);
+                return updated;
+            });
         }
 
-        if (!data.conversation_id && response.conversation_id) {
-            setData('conversation_id', response.conversation_id);
+        // Persist conversation_id whenever the server returns one
+        if (response.conversation_id) {
+            if (!data.conversation_id) {
+                setData('conversation_id', response.conversation_id);
+            }
+            persistConversationId(response.conversation_id);
         }
     }, [auth.chatResponse]);
 
@@ -180,17 +262,31 @@ export default function Chat() {
         scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [localMessages, processing, confirming]);
 
+    // ── Start a fresh conversation ─────────────────────────────────────────
+    const handleNewConversation = () => {
+        clearPersistedConversation();
+        setData('conversation_id', null);
+        setHitlState({ active: false, pendingId: null });
+        setConfirming(false);
+        setLocalMessages([WELCOME_MESSAGE]);
+        persistMessages([WELCOME_MESSAGE]);
+    };
+
     // ── Submit main message ────────────────────────────────────────────────
     const submit = (e) => {
         e?.preventDefault();
         if ((!data.message.trim() && data.attachments.length === 0) || processing) return;
 
-        setLocalMessages(prev => [...prev, {
-            id:              Date.now() + 1,
-            role:            'user',
-            content:         data.message.trim(),
-            attachmentCount: data.attachments.length,
-        }]);
+        setLocalMessages(prev => {
+            const updated = [...prev, {
+                id:              Date.now() + 1,
+                role:            'user',
+                content:         data.message.trim(),
+                attachmentCount: data.attachments.length,
+            }];
+            persistMessages(updated);
+            return updated;
+        });
 
         post(route('accounting.chat.send'), {
             preserveScroll: true,
@@ -212,49 +308,57 @@ export default function Chat() {
     const handleHitlConfirm = (pendingId, attachments) => {
         setConfirming(true);
 
-        setLocalMessages(prev => [...prev, {
-            id:      Date.now(),
-            role:    'user',
-            content: '✅ Confirmed — proceeding with the action.',
-        }]);
+        setLocalMessages(prev => {
+            const updated = [...prev, {
+                id:      Date.now(),
+                role:    'user',
+                content: '✅ Confirmed — proceeding with the action.',
+            }];
+            persistMessages(updated);
+            return updated;
+        });
 
         router.post(
             route('accounting.chat.confirm'),
-            { pending_id: pendingId,conversation_id: data.conversation_id, attachments },
+            { pending_id: pendingId, conversation_id: data.conversation_id, attachments },
             {
                 preserveScroll: true,
                 preserveState:  true,
                 onError: () => {
                     setConfirming(false);
                     setHitlState({ active: false, pendingId: null });
-                    setLocalMessages(prev => [...prev, {
-                        id:      Date.now(),
-                        role:    'assistant',
-                        content: 'The confirmation could not be processed. Please try again.',
-                    }]);
+                    setLocalMessages(prev => {
+                        const updated = [...prev, {
+                            id:      Date.now(),
+                            role:    'assistant',
+                            content: 'The confirmation could not be processed. Please try again.',
+                        }];
+                        persistMessages(updated);
+                        return updated;
+                    });
                 },
             }
         );
     };
 
     // ── Cancel HITL checkpoint — client-only, no backend call needed ───────
-    // In handleHitlCancel:
     const handleHitlCancel = () => {
         setHitlState({ active: false, pendingId: null });
 
-        // Mark the HITL message as cancelled so it stops rendering as a card
-        // AND doesn't fall through to the standard bubble renderer
-        setLocalMessages(prev => prev.map(msg =>
-            msg.isHitl && msg.pendingId === hitlState.pendingId
-                ? { ...msg, cancelled: true }
-                : msg
-        ));
-
-        setLocalMessages(prev => [...prev, {
-            id:      Date.now(),
-            role:    'assistant',
-            content: 'Action cancelled. How else can I help you?',
-        }]);
+        setLocalMessages(prev => {
+            const updated = prev.map(msg =>
+                msg.isHitl && msg.pendingId === hitlState.pendingId
+                    ? { ...msg, cancelled: true }
+                    : msg
+            );
+            const withCancel = [...updated, {
+                id:      Date.now(),
+                role:    'assistant',
+                content: 'Action cancelled. How else can I help you?',
+            }];
+            persistMessages(withCancel);
+            return withCancel;
+        });
     };
 
     const handleInput = (e) => {
@@ -302,11 +406,11 @@ export default function Chat() {
     ];
 
     const botFeatures = [
-        { icon: <Building size={18} />, title: 'Business Details',     desc: 'Create and View your company profile, and manage Narration Head and Sub Head.' },
-        { icon: <Users    size={18} />, title: 'Client Management',    desc: 'Look up client details, create new clients, update clients and delete clients.' },
-        { icon: <Package  size={18} />, title: 'Inventory Management', desc: 'Look up inventory items, add new products, update stock levels, and delete items.' },
-        { icon: <FileText size={18} />, title: 'Invoice Management',   desc: 'Draft new invoices, preview PDFs, fetch existing records, and manage your billing.' },
-        { icon: <ArrowLeftRight  size={18} />, title: 'Bank Transactions',     desc: 'Review, narrate, and reconcile bank transactions with invoice. Flag suspicious entries and match credits to invoices.' }
+        { icon: <Building size={18} />,        title: 'Business Details',     desc: 'Create and View your company profile, and manage Narration Head and Sub Head.' },
+        { icon: <Users size={18} />,            title: 'Client Management',    desc: 'Look up client details, create new clients, update clients and delete clients.' },
+        { icon: <Package size={18} />,          title: 'Inventory Management', desc: 'Look up inventory items, add new products, update stock levels, and delete items.' },
+        { icon: <FileText size={18} />,         title: 'Invoice Management',   desc: 'Draft new invoices, preview PDFs, fetch existing records, and manage your billing.' },
+        { icon: <ArrowLeftRight size={18} />,   title: 'Bank Transactions',    desc: 'Review, narrate, and reconcile bank transactions with invoice. Flag suspicious entries and match credits to invoices.' },
     ];
 
     return (
@@ -337,12 +441,25 @@ export default function Chat() {
                                     </div>
                                 </div>
 
-                                {hitlState.active && (
-                                    <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 border border-amber-200 rounded-full">
-                                        <AlertTriangle size={12} className="text-amber-600" />
-                                        <span className="text-[10px] font-semibold text-amber-700">Awaiting confirmation</span>
-                                    </div>
-                                )}
+                                <div className="flex items-center gap-2">
+                                    {/* New conversation button — clears localStorage + resets all state */}
+                                    <button
+                                        type="button"
+                                        onClick={handleNewConversation}
+                                        title="Start a new conversation"
+                                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-500 border border-gray-200 rounded-full hover:bg-gray-50 hover:text-gray-700 transition-colors"
+                                    >
+                                        <Plus size={13} />
+                                        New chat
+                                    </button>
+
+                                    {hitlState.active && (
+                                        <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 border border-amber-200 rounded-full">
+                                            <AlertTriangle size={12} className="text-amber-600" />
+                                            <span className="text-[10px] font-semibold text-amber-700">Awaiting confirmation</span>
+                                        </div>
+                                    )}
+                                </div>
                             </header>
 
                             {errors.ai && (
@@ -407,13 +524,13 @@ export default function Chat() {
                                                     <ReactMarkdown
                                                         remarkPlugins={[remarkGfm]}
                                                         components={{
-                                                            p: ({node, ...props}) => <p className="mb-2 last:mb-0" {...props} />,
-                                                            table: ({node, ...props}) => (
+                                                            p: ({ node, ...props }) => <p className="mb-2 last:mb-0" {...props} />,
+                                                            table: ({ node, ...props }) => (
                                                                 <div className="overflow-x-auto my-3">
                                                                     <table className="min-w-full divide-y divide-gray-200 border border-gray-200 text-xs sm:text-sm" {...props} />
                                                                 </div>
                                                             ),
-                                                            a: ({node, href, children, ...props}) => {
+                                                            a: ({ node, href, children, ...props }) => {
                                                                 const text  = Array.isArray(children) ? children.join('') : String(children);
                                                                 const isPdf = href?.toLowerCase().includes('.pdf') || text.toLowerCase().includes('pdf');
                                                                 if (isPdf) {

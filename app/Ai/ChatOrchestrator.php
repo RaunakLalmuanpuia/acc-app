@@ -342,17 +342,58 @@ class ChatOrchestrator
                 if (!empty($setupIntents) && in_array('invoice', $intents)) {
                     $allSetupDone = true;
 
+                    // Scope to the current multi-intent group's timeframe only.
+                    // Without this, a completed invoice from a PRIOR invoice request
+                    // in the same conversation falsely triggers completion detection
+                    // for a NEW invoice request — causing InvoiceAgent to look for
+                    // a sent/voided invoice instead of creating a fresh one.
+                    $invoiceAlreadyCreated = DB::table('agent_conversation_messages')
+                        ->where('conversation_id', $conversationId . ':invoice')
+                        ->where('role', 'assistant')
+                        ->whereRaw("JSON_EXTRACT(meta, '$.invoice_number') IS NOT NULL")
+                        ->where('created_at', '>=', $lastMultiMessage->created_at)
+                        ->exists();
+
+                    if ($invoiceAlreadyCreated) {
+                        Log::info('[ChatOrchestrator] Invoice already created — setup complete', [
+                            'conversation_id' => $conversationId,
+                        ]);
+                        $this->loadActiveInvoiceNumber($conversationId);
+                        return ['invoice'];
+                    }
+
+
                     foreach ($setupIntents as $setupIntent) {
-                        $lastReply = DB::table('agent_conversation_messages')
+                        // Check ANY historical message for a structured completion marker,
+                        // not just the last message.
+                        //
+                        // WHY: A later turn can overwrite the last assistant message with a
+                        // scope refusal ("I'm your accounting assistant...") or a HANDOFF.
+                        // Last-message text checks then see no ✅ and falsely conclude setup
+                        // is incomplete — causing all 3 agents to fire on every continuation.
+                        //
+                        // The structured ID markers ([CLIENT_ID:], [INVENTORY_ITEM_ID:]) are
+                        // only ever emitted after a successful creation. Scope refusals, scope
+                        // guard blocks, and HANDOFF replies never contain them — making them
+                        // a reliable completion signal regardless of what came after.
+                        $completionMarker = match ($setupIntent) {
+                            'client'    => '[CLIENT_ID:',
+                            'inventory' => '[INVENTORY_ITEM_ID:',
+                            default     => '✅',
+                        };
+
+                        // Scope to current multi-intent group's timeframe only.
+                        // Without this, markers ([CLIENT_ID:], [INVENTORY_ITEM_ID:])
+                        // from a PRIOR invoice in the same conversation falsely
+                        // signal completion for a NEW invoice request — causing
+                        // the orchestrator to inject a sent invoice's number
+                        // into InvoiceAgent's prompt as the "active" invoice.
+                        $isDone = DB::table('agent_conversation_messages')
                             ->where('conversation_id', $conversationId . ':' . $setupIntent)
                             ->where('role', 'assistant')
-                            ->orderByDesc('created_at')
-                            ->value('content');
-
-                        $isDone = $lastReply !== null
-                            && str_contains($lastReply, '✅')
-                            && !str_contains($lastReply, '⏳')
-                            && !preg_match('/\?\s*$/', trim($lastReply));
+                            ->where('content', 'LIKE', '%' . $completionMarker . '%')
+                            ->where('created_at', '>=', $lastMultiMessage->created_at)
+                            ->exists();
 
                         if (!$isDone) {
                             $allSetupDone = false;

@@ -16,7 +16,7 @@ use Laravel\Ai\Enums\Lab;
 
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o')]
-#[MaxSteps(5)]
+#[MaxSteps(15)]
 #[MaxTokens(2000)]
 #[Temperature(0.1)]
 class InventoryAgent extends BaseAgent
@@ -61,6 +61,9 @@ class InventoryAgent extends BaseAgent
              → Reply with ONLY:
                "✅ [Name] found in inventory at ₹[rate]/[unit]."
                [INVENTORY_ITEM_ID:{numeric id from get_inventory result}]
+               Then output NOTHING else.
+               Do NOT add any ⏳ line.
+               Do NOT ask if the user wants to update.
                Then output NOTHING else. Do NOT ask if the user wants to update.
            • Not found → proceed to step 2.
 
@@ -86,8 +89,12 @@ class InventoryAgent extends BaseAgent
            • "7640876052, xyz@mail.com, 200" → phone=7640876052, email=xyz@mail.com,
              rate=200. Do NOT ask for rate again.
 
-           CRITICAL — when part of an invoice request, end reply with:
+          CRITICAL — when part of an invoice request AND item was NOT found:
+           End your reply with EXACTLY:
            "⏳ Once I have the rate, I'll add it to your inventory and your invoice will proceed."
+
+           When item WAS found (already exists): NEVER add a ⏳ line.
+           The found + multi-agent case is handled entirely in step 1 above.
 
         3. CONFIRM STEP — SKIP when in a multi-agent turn AND rate is already known.
            Call create_inventory_item IMMEDIATELY. No confirmation table.

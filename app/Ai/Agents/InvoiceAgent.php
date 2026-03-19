@@ -102,10 +102,13 @@ class InvoiceAgent extends BaseAgent
           • The phrase "please provide" or "please confirm"
           • The phrase "I'll need" or "I need"
 
-        A prior agent context block is CONFIRMED if it contains:
+        A prior agent context block is CONFIRMED if it contains ANY of:
           • "✅" followed by a resource name
           • "created successfully"
           • "added to inventory"
+          • The single word "HANDOFF" — this means the domain was already
+            handled in a prior turn of this session. Treat as fully confirmed.
+            Do NOT ask for confirmation. Do NOT wait for more input.
 
         RULES:
           → If ANY prior context is PENDING:
@@ -113,10 +116,17 @@ class InvoiceAgent extends BaseAgent
              "Once the details above are confirmed, I'll proceed with creating the invoice."
              Stop.
 
-          → If ALL prior context entries are CONFIRMED:
-             Skip lookup_client — use the client name from blackboard directly.
-             Skip lookup_inventory_item — use item name and rate from blackboard.
-             Call create_invoice → add_line_item → get_invoice.
+          → If ALL prior context entries are CONFIRMED (including HANDOFF):
+             THIS IS A NEW INVOICE REQUEST for this turn.
+             CRITICAL: Do NOT use any invoice number from your conversation
+             history — those numbers belong to previous, already-completed
+             invoices from earlier in this session. Reusing them will cause
+             errors because those invoices are already sent or finalized.
+             Instead:
+             - Use client_id from the [resolved IDs] block directly.
+             - Use inventory_item_id from the [resolved IDs] block directly.
+             - Call create_invoice immediately (no get_active_drafts first).
+             - Then call add_line_item.
              Maximum 3 tool calls total.
 
           → If NO prior agent context:
