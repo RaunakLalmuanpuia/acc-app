@@ -14,36 +14,38 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * ChatOrchestrator  (v3 — invoice number injection + smart DB fallback)
+ * ChatOrchestrator  (v5 — FIX 4 scope fix)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v2
+ * CHANGES FROM v4
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * FIX 1 — getLastIntents(): timestamp-based completion detection
- *   If the {id}:invoice scoped conversation has a message newer than the last
- *   multi-intent turn, the setup phase is done — return ['invoice'] only.
- *   This prevents client/inventory agents from firing on follow-ups like
- *   "generate the pdf" or "review the invoice" after setup completes.
+ * FIX 4 SCOPE BUG (v4 regression):
  *
- * FIX 2 — getLastIntents(): content-based completion fallback
- *   When timestamps are equal (same-turn creation), scan the reply content of
- *   each setup intent's scoped conversation. A setup intent is "done" when its
- *   last reply contains ✅ and no ⏳ and no trailing question.
+ *   v4 added $newerNonInvoice guards inside FIX 1 and the two FIX 2 branches
+ *   with comments saying "fall through to single-intent fallback". But PHP has
+ *   no labelled break — "falling through" only exited the nested if/else.
+ *   Execution continued into the multi-intent group block's secondary/primary
+ *   pruning section, which had no guard and returned ['invoice'] via the
+ *   "Setup intents complete — primary only" path.
  *
- * FIX 3 — activeInvoiceNumber injection
- *   When getLastIntents() returns ['invoice'], it also reads the stored
- *   invoice_number from meta and sets $this->activeInvoiceNumber.
- *   executeDispatch() passes this to the dispatcher, which injects it as a
- *   system hint into InvoiceAgent's prompt — giving it the invoice number even
- *   when its scoped conversation history is fragmented across turns.
+ *   Concretely: the pruning block found [CLIENT_ID: and [INVENTORY_ITEM_ID:
+ *   from the prior xyz invoice setup (no created_at filter), declared secondary
+ *   intents complete, and returned ['invoice'] — overriding both FIX 4 guards.
+ *
+ * FIX:
+ *   Replace scattered per-branch $newerNonInvoice checks with a single
+ *   $skipToSingleIntent boolean computed ONCE before any branching.
+ *   The entire multi-intent group block is wrapped in if (!$skipToSingleIntent)
+ *   so when FIX 4 fires, ALL of that block — including the pruning section —
+ *   is bypassed. Execution falls directly to the single-intent row fallback,
+ *   which correctly returns the most recently active intent (client, narration,
+ *   bank_transaction, etc.).
+ *
+ *   The $newerNonInvoice EXISTS query now runs at most once per turn.
  */
 class ChatOrchestrator
 {
-    /**
-     * Holds the active invoice number when detected during DB fallback.
-     * Injected into InvoiceAgent's prompt to survive context fragmentation.
-     */
     private ?string $activeInvoiceNumber = null;
 
     public function __construct(
@@ -55,9 +57,6 @@ class ChatOrchestrator
         private readonly ScopeGuardService      $scopeGuard,
     ) {}
 
-    /**
-     * Handle a single chat turn end-to-end.
-     */
     public function handle(
         User    $user,
         string  $message,
@@ -67,9 +66,8 @@ class ChatOrchestrator
         $turnStart = microtime(true);
         $turnId    = Str::uuid()->toString();
         $this->observability->setTurnId($turnId);
-        $this->activeInvoiceNumber = null; // reset per turn
+        $this->activeInvoiceNumber = null;
 
-        // ── Step 0: Scope guard ───────────────────────────────────────────────
         $guardResult = $this->scopeGuard->evaluate($message, (string) $user->id);
 
         if (!$guardResult->allowed) {
@@ -86,12 +84,10 @@ class ChatOrchestrator
             'message_preview' => mb_substr($message, 0, 80),
         ]);
 
-        // ── Step 1: Route ─────────────────────────────────────────────────────
         $intents = $this->router->resolve($message, $conversationId);
 
         Log::info('[ChatOrchestrator] Resolved intents', ['intents' => $intents]);
 
-        // ── Step 2: DB fallback ───────────────────────────────────────────────
         if (empty($intents) && $conversationId !== null) {
             $lastIntents = $this->getLastIntents($conversationId);
 
@@ -104,7 +100,6 @@ class ChatOrchestrator
             }
         }
 
-        // ── Step 3: Unknown gate ──────────────────────────────────────────────
         if (empty($intents)) {
             return [
                 'reply'           => $this->merger->unknownResponse(),
@@ -113,7 +108,6 @@ class ChatOrchestrator
             ];
         }
 
-        // ── Step 4: HITL checkpoint ───────────────────────────────────────────
         if ($this->hitl->requiresCheckpoint($message, $intents)) {
             $pendingId = $this->hitl->storePendingAction(
                 userId:         (string) $user->id,
@@ -136,7 +130,6 @@ class ChatOrchestrator
             ];
         }
 
-        // ── Step 5 & 6: Dispatch + merge ──────────────────────────────────────
         return $this->executeDispatch(
             user:           $user,
             message:        $message,
@@ -148,22 +141,15 @@ class ChatOrchestrator
         );
     }
 
-    /**
-     * Resume a HITL-gated action after explicit user confirmation.
-     */
     public function confirm(
         User   $user,
         string $pendingId,
         array  $attachments = [],
     ): array {
         $turnStart = microtime(true);
-
-        // ↓ ADD THESE THREE LINES
-        $turnId = Str::uuid()->toString();
+        $turnId    = Str::uuid()->toString();
         $this->observability->setTurnId($turnId);
         $this->activeInvoiceNumber = null;
-
-
 
         $action = $this->hitl->consumePendingAction($pendingId);
 
@@ -266,15 +252,13 @@ class ChatOrchestrator
      * Retrieve the last used intents from conversation message metadata.
      *
      * Priority order:
-     *  1. If {id}:invoice has a message newer than the last multi-intent turn
-     *     → invoice workflow is active, return ['invoice'] only.
-     *  2. If multi-intent group exists, check content-based completion:
-     *     all setup intents (client, inventory) show ✅ with no ⏳ → ['invoice'].
-     *  3. Otherwise replay the full multi-intent group.
-     *  4. Fall back to the most recent single-intent row.
-     *
-     * Side effect: sets $this->activeInvoiceNumber when returning ['invoice'],
-     * so the dispatcher can inject it into InvoiceAgent's prompt.
+     *  1. If a non-invoice scoped conversation is more recent than the invoice
+     *     → skip all multi-intent logic, fall to single-intent fallback.
+     *  2. If {id}:invoice is newer than the last multi-intent turn → ['invoice'].
+     *  3. Multi-intent group: content-based completion check → ['invoice']
+     *     if all setup intents are done and invoice already created.
+     *  4. Multi-intent group: secondary/primary pruning.
+     *  5. Fall back to the most recent single-intent row.
      */
     private function getLastIntents(string $conversationId): array
     {
@@ -283,9 +267,6 @@ class ChatOrchestrator
                 ->orWhere('conversation_id', 'like', $conversationId . ':%');
         };
 
-        // ── FIX 1: timestamp comparison ───────────────────────────────────────
-        // If {id}:invoice was updated more recently than the last multi-intent
-        // message, setup is complete and the invoice workflow is active.
         $lastInvoiceMessage = DB::table('agent_conversation_messages')
             ->where('conversation_id', $conversationId . ':invoice')
             ->where('role', 'assistant')
@@ -299,18 +280,50 @@ class ChatOrchestrator
             ->orderByDesc('created_at')
             ->first();
 
-        if ($lastInvoiceMessage !== null && $lastMultiMessage !== null) {
-            if ($lastInvoiceMessage->created_at > $lastMultiMessage->created_at) {
-                Log::info('[ChatOrchestrator] Invoice more recent than multi-intent group — invoice only', [
+        // ── FIX 4: compute skip flag once ────────────────────────────────────
+        //
+        // If ANY non-invoice scoped conversation has an assistant message more
+        // recent than the last invoice message, the user has moved on to a new
+        // single-intent flow. Bypass the entire multi-intent block so the
+        // single-intent fallback at the bottom selects the correct agent.
+        //
+        // This flag gates the multi-intent block as a whole — not individual
+        // return statements inside it. That was the v4 bug: the pruning section
+        // inside the block had no guard and still ran, returning ['invoice'].
+        $skipToSingleIntent = false;
+
+        if ($lastInvoiceMessage !== null) {
+            $newerNonInvoice = DB::table('agent_conversation_messages')
+                ->where('conversation_id', 'like', $conversationId . ':%')
+                ->where('conversation_id', '!=', $conversationId . ':invoice')
+                ->where('role', 'assistant')
+                ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
+                ->where('created_at', '>', $lastInvoiceMessage->created_at)
+                ->exists();
+
+            if ($newerNonInvoice) {
+                $skipToSingleIntent = true;
+                Log::info('[ChatOrchestrator] Non-invoice context more recent than invoice — skipping to single-intent fallback', [
                     'conversation_id' => $conversationId,
                 ]);
-                $this->loadActiveInvoiceNumber($conversationId);
-                return ['invoice'];
             }
         }
 
-        // ── Multi-intent group logic ──────────────────────────────────────────
-        if ($lastMultiMessage !== null) {
+        // ── FIX 1: invoice timestamp wins (only when not skipping) ────────────
+        if (!$skipToSingleIntent
+            && $lastInvoiceMessage !== null
+            && $lastMultiMessage !== null
+            && $lastInvoiceMessage->created_at > $lastMultiMessage->created_at
+        ) {
+            Log::info('[ChatOrchestrator] Invoice more recent than multi-intent group — invoice only', [
+                'conversation_id' => $conversationId,
+            ]);
+            $this->loadActiveInvoiceNumber($conversationId);
+            return ['invoice'];
+        }
+
+        // ── Multi-intent group logic (skipped entirely when $skipToSingleIntent) ──
+        if (!$skipToSingleIntent && $lastMultiMessage !== null) {
             $meta   = json_decode($lastMultiMessage->meta ?? '{}', true);
             $turnId = $meta['turn_id'] ?? null;
 
@@ -342,11 +355,6 @@ class ChatOrchestrator
                 if (!empty($setupIntents) && in_array('invoice', $intents)) {
                     $allSetupDone = true;
 
-                    // Scope to the current multi-intent group's timeframe only.
-                    // Without this, a completed invoice from a PRIOR invoice request
-                    // in the same conversation falsely triggers completion detection
-                    // for a NEW invoice request — causing InvoiceAgent to look for
-                    // a sent/voided invoice instead of creating a fresh one.
                     $invoiceAlreadyCreated = DB::table('agent_conversation_messages')
                         ->where('conversation_id', $conversationId . ':invoice')
                         ->where('role', 'assistant')
@@ -362,20 +370,7 @@ class ChatOrchestrator
                         return ['invoice'];
                     }
 
-
                     foreach ($setupIntents as $setupIntent) {
-                        // Check ANY historical message for a structured completion marker,
-                        // not just the last message.
-                        //
-                        // WHY: A later turn can overwrite the last assistant message with a
-                        // scope refusal ("I'm your accounting assistant...") or a HANDOFF.
-                        // Last-message text checks then see no ✅ and falsely conclude setup
-                        // is incomplete — causing all 3 agents to fire on every continuation.
-                        //
-                        // The structured ID markers ([CLIENT_ID:], [INVENTORY_ITEM_ID:]) are
-                        // only ever emitted after a successful creation. Scope refusals, scope
-                        // guard blocks, and HANDOFF replies never contain them — making them
-                        // a reliable completion signal regardless of what came after.
                         $completionMarker = match ($setupIntent) {
                             'client'    => '[CLIENT_ID:',
                             'inventory' => '[INVENTORY_ITEM_ID:',
@@ -383,12 +378,6 @@ class ChatOrchestrator
                             default     => '✅',
                         };
 
-                        // Scope to current multi-intent group's timeframe only.
-                        // Without this, markers ([CLIENT_ID:], [INVENTORY_ITEM_ID:])
-                        // from a PRIOR invoice in the same conversation falsely
-                        // signal completion for a NEW invoice request — causing
-                        // the orchestrator to inject a sent invoice's number
-                        // into InvoiceAgent's prompt as the "active" invoice.
                         $isDone = DB::table('agent_conversation_messages')
                             ->where('conversation_id', $conversationId . ':' . $setupIntent)
                             ->where('role', 'assistant')
@@ -412,6 +401,7 @@ class ChatOrchestrator
                     }
                 }
 
+                // ── Secondary/primary pruning ─────────────────────────────────
                 $primaryIntents   = ['bank_transaction', 'invoice'];
                 $secondaryIntents = array_diff($intents, $primaryIntents);
 
@@ -430,7 +420,7 @@ class ChatOrchestrator
                             ->where('conversation_id', $conversationId . ':' . $setupIntent)
                             ->where('role', 'assistant')
                             ->where('content', 'LIKE', '%' . $completionMarker . '%')
-                            ->exists(); // ← no created_at filter here
+                            ->exists();
 
                         if (!$isDone) {
                             $remainingSetup[] = $setupIntent;
@@ -476,14 +466,6 @@ class ChatOrchestrator
         return $intent ? [$intent] : [];
     }
 
-    /**
-     * Load the most recently stored invoice_number from the scoped invoice
-     * conversation's message meta into $this->activeInvoiceNumber.
-     *
-     * Called whenever getLastIntents() determines the invoice workflow is active.
-     * The stored number is then injected into InvoiceAgent's prompt so it can
-     * recover context even when its conversation history is fragmented.
-     */
     private function loadActiveInvoiceNumber(string $conversationId): void
     {
         $metaJson = DB::table('agent_conversation_messages')

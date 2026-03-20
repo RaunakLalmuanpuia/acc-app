@@ -15,21 +15,21 @@ use Laravel\Ai\Promptable;
 use Stringable;
 
 /**
- * RouterAgent  (v5 — co-routing exception for new clients/inventory)
+ * RouterAgent  (v6 — bank_transaction listing fix)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v4
+ * CHANGES FROM v5
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * The REFERENCE_ONLY suppression rule for "client" now includes an explicit
- * EXCEPTION: when the invoice names a likely-new or unfamiliar client, include
- * "client" so ClientAgent can check existence and create if needed.
+ * FIX 1 — bank_transaction domain definition
+ *   Added casual trigger phrases ("show me my transactions", "list transactions",
+ *   "recent payments", etc.) to the definition. gpt-4o-mini at Temperature(0)
+ *   was mapping these to 'unknown' because the v5 definition only listed formal
+ *   verbs (reviewing, categorising, reconciling) with no listing/viewing examples.
  *
- * Similarly, when an invoice names a product that sounds like it may not be in
- * inventory yet (combined with a new/unknown client), include "inventory".
- *
- * The suppression rules are still derived dynamically from AgentRegistry —
- * the exception text is injected via the $examples array which is human-curated.
+ * FIX 2 — Rule 8: bank_transaction listing examples
+ *   Concrete ✓ RIGHT examples anchor the model to the correct classification
+ *   for the full family of "show/list/view transactions" queries.
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o-mini')]
@@ -117,8 +117,13 @@ class RouterAgent implements Agent, HasTools
                                    products / services as the PRIMARY GOAL.',
             'narration'        => 'narration heads, sub-heads, transaction categories, ledger heads.',
             'business'         => 'company/business profile, GST number, PAN, bank details, address.',
-            'bank_transaction' => 'reviewing, categorising, flagging, or reconciling bank transactions;
-                                   viewing transaction history; matching credits to invoices.',
+            // FIX 1: added casual listing/viewing trigger phrases so gpt-4o-mini does not
+            // map "show me my transactions" / "list transactions" to 'unknown'.
+            'bank_transaction' => 'reviewing, categorising, flagging, reconciling, or LISTING / SHOWING /
+                                   VIEWING bank transactions; transaction history; matching credits to
+                                   invoices. Casual triggers: "show me my transactions", "list
+                                   transactions", "what came in", "recent payments / debits / credits",
+                                   "my bank entries", "any new transactions".',
             'unknown'          => 'greetings, thank-yous, out-of-scope questions, or anything
                                    unrelated to accounting.',
         ];
@@ -223,6 +228,18 @@ class RouterAgent implements Agent, HasTools
 
            NOTE: "add a narration head called X" with NO transaction context
                  → ["narration"] only. The pronoun/assignment phrase is the key signal.
+
+        8. "bank_transaction" LISTING / VIEWING queries:
+           Any message asking to see, list, show, or fetch transactions — regardless
+           of phrasing formality — is "bank_transaction". Never map these to "unknown".
+
+           ✓ RIGHT: "show me my transactions"          → ["bank_transaction"]
+           ✓ RIGHT: "list transactions"                → ["bank_transaction"]
+           ✓ RIGHT: "what came in this month"          → ["bank_transaction"]
+           ✓ RIGHT: "any recent payments"              → ["bank_transaction"]
+           ✓ RIGHT: "show new debits"                  → ["bank_transaction"]
+           ✓ RIGHT: "my bank entries for last week"    → ["bank_transaction"]
+           ✓ RIGHT: "have any credits arrived"         → ["bank_transaction"]
         RULES;
     }
 }
