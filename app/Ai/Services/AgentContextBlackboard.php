@@ -148,6 +148,23 @@ class AgentContextBlackboard
             }
         }
 
+        if ($forIntent === 'bank_transaction') {
+            $headId    = $this->getMeta('narration_head_id');
+            $subHeadId = $this->getMeta('narration_sub_head_id');
+
+            if ($headId || $subHeadId) {
+                $lines[] = '── [resolved IDs — use directly, skip lookup tools] ────────────';
+                if ($headId) {
+                    $lines[] = "⚙ narration_head_id = {$headId} → pass directly to narrate_transaction.";
+                }
+                if ($subHeadId) {
+                    $lines[] = "⚙ narration_sub_head_id = {$subHeadId} → pass directly to narrate_transaction.";
+                }
+                $lines[] = '── [end resolved IDs] ───────────────────────────────────────────';
+                $lines[] = '';
+            }
+        }
+
         $lines[] = '════════════════════════════════════════════════════════════════';
         $lines[] = '';
 

@@ -104,6 +104,15 @@ class NarrationAgent extends BaseAgent
         When listing heads, call get_narration_heads with NO arguments unless
         the user explicitly asks to filter by type.
 
+
+        - When operating in a multi-agent turn (PRIOR AGENT CONTEXT block present
+          or message contains "assign", "use it", "for this transaction"):
+          After creating the head AND sub-head, append these tags on their own lines
+          with no markdown, no spaces:
+          [NARRATION_HEAD_ID:{numeric id returned by create_narration_head}]
+          [NARRATION_SUB_HEAD_ID:{numeric id returned by create_narration_sub_head}]
+          Then output NOTHING else.
+
         ═════════════════════════════════════════════════════════════════════════
         SYSTEM HEADS (READ-ONLY)
         ═════════════════════════════════════════════════════════════════════════
@@ -120,6 +129,34 @@ class NarrationAgent extends BaseAgent
         The HITL checkpoint (handled upstream) will have intercepted this before
         this agent is called. When the ✅ HITL PRE-AUTHORIZED block is present,
         call get_narration_heads first to confirm the correct IDs, then delete.
+
+        ═════════════════════════════════════════════════════════════════════════
+        MULTI-AGENT HANDOFF PROTOCOL  (MANDATORY when in a multi-agent turn)
+        ═════════════════════════════════════════════════════════════════════════
+
+        A multi-agent turn is active when the user message contains ANY of:
+          "assign", "use it", "for this transaction", "this transaction",
+          "then narrate", "then categorize", "as the head"
+        OR when a PRIOR AGENT CONTEXT block is present at the top of this prompt.
+
+        When this protocol is active:
+
+        1. Infer head type from transaction context (debit → "debit", credit → "credit").
+           Ask ONLY for type if completely ambiguous. Never ask for anything else.
+
+        2. After creating the head AND sub-head successfully, your ENTIRE reply
+           must be EXACTLY these lines and nothing else:
+
+           ✅ Head '[name]' and sub-head '[sub-name]' created.
+           [NARRATION_HEAD_ID:{id returned by create_narration_head}]
+           [NARRATION_SUB_HEAD_ID:{id returned by create_narration_sub_head}]
+
+           CRITICAL: The tag lines must contain the actual numeric IDs from the
+           tool results — never placeholder text. No markdown. No extra sentences.
+           No "If you need further assistance". Nothing after the last tag line.
+
+        3. Do NOT call get_narration_heads after creating — you already have the
+           ID from the create_narration_head tool result. Use it directly.
 
         ═════════════════════════════════════════════════════════════════════════
         GENERAL BEHAVIOUR

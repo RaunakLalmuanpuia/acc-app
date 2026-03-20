@@ -108,8 +108,8 @@ class IntentRouterService
         // They contain field:value pairs but no action verb at the start.
         $hasActionVerb = preg_match(
             '/^\s*(create|make|generate|show|list|view|find|search|
-        add|update|edit|delete|remove|void|cancel|send|
-        fetch|get|give|issue|record)\b/ix',
+            add|update|edit|delete|remove|void|cancel|send|
+            fetch|get|give|issue|record|mark|flag|reconcile|approve)\b/ix',
             $message
         );
 

@@ -84,7 +84,11 @@ class AgentDispatcherService
             $results[$intent] = $result;
 
             $rawReply   = $result['reply'];
-            $cleanReply = preg_replace('/\[(CLIENT_ID|INVENTORY_ITEM_ID):\d+\]\n?/', '', $rawReply);
+            $cleanReply = preg_replace(
+                '/\[(CLIENT_ID|INVENTORY_ITEM_ID|NARRATION_HEAD_ID|NARRATION_SUB_HEAD_ID):\d+\]\n?/',
+                '',
+                $rawReply
+            );
 
             $result['reply']          = $cleanReply;
             $results[$intent]['reply'] = $cleanReply;
@@ -295,6 +299,36 @@ class AgentDispatcherService
      * loads the history from the multi-intent setup phase rather than a bare
      * base conversation with no relevant history.
      */
+//    private function configureConversation(
+//        Agent   $agent,
+//        User    $user,
+//        ?string $conversationId,
+//        string  $intent,
+//        bool    $multiIntent,
+//    ): Agent {
+//        if ($conversationId === null) {
+//            return $agent->forUser($user);
+//        }
+//
+//        if ($multiIntent) {
+//            return $agent->continue("{$conversationId}:{$intent}", as: $user);
+//        }
+//
+//        $scopedId     = "{$conversationId}:{$intent}";
+//        $scopedExists = DB::table('agent_conversation_messages')
+//            ->where('conversation_id', $scopedId)
+//            ->exists();
+//
+//        if ($scopedExists) {
+//            Log::info('[AgentDispatcherService] Single-intent follow-up using scoped conversation', [
+//                'intent'    => $intent,
+//                'scoped_id' => $scopedId,
+//            ]);
+//            return $agent->continue($scopedId, as: $user);
+//        }
+//
+//        return $agent->continue($conversationId, as: $user);
+//    }
     private function configureConversation(
         Agent   $agent,
         User    $user,
@@ -306,24 +340,32 @@ class AgentDispatcherService
             return $agent->forUser($user);
         }
 
-        if ($multiIntent) {
-            return $agent->continue("{$conversationId}:{$intent}", as: $user);
-        }
+        $scopedId = "{$conversationId}:{$intent}";
 
-        $scopedId     = "{$conversationId}:{$intent}";
+        // Prefer scoped if it already exists — created during a prior multi-intent
+        // setup turn. NarrationAgent's history lives here after Turn 3.
         $scopedExists = DB::table('agent_conversation_messages')
             ->where('conversation_id', $scopedId)
             ->exists();
 
         if ($scopedExists) {
-            Log::info('[AgentDispatcherService] Single-intent follow-up using scoped conversation', [
-                'intent'    => $intent,
-                'scoped_id' => $scopedId,
-            ]);
             return $agent->continue($scopedId, as: $user);
         }
 
-        return $agent->continue($conversationId, as: $user);
+        // Scoped doesn't exist yet. Check whether the base conversation already
+        // contains messages from THIS intent's agent.
+        // YES → this agent owns the base conversation, continue there (preserves history).
+        // NO  → base belongs to a different agent, start fresh on scoped (prevents bleed).
+        $baseHasThisIntent = DB::table('agent_conversation_messages')
+            ->where('conversation_id', $conversationId)
+            ->whereRaw("JSON_EXTRACT(meta, '$.intent') = ?", [$intent])
+            ->exists();
+
+        if ($baseHasThisIntent) {
+            return $agent->continue($conversationId, as: $user);
+        }
+
+        return $agent->continue($scopedId, as: $user);
     }
 
     private function resolveOutcomeSignal(string $intent, mixed $response): ?string
@@ -494,6 +536,15 @@ class AgentDispatcherService
         if ($intent === 'inventory') {
             if (preg_match('/\[INVENTORY_ITEM_ID:(\d+)\]/', $reply, $m)) {
                 $blackboard->setMeta('inventory_item_id', (int) $m[1]);
+            }
+        }
+
+        if ($intent === 'narration') {
+            if (preg_match('/\[NARRATION_HEAD_ID:(\d+)\]/', $reply, $m)) {
+                $blackboard->setMeta('narration_head_id', (int) $m[1]);
+            }
+            if (preg_match('/\[NARRATION_SUB_HEAD_ID:(\d+)\]/', $reply, $m)) {
+                $blackboard->setMeta('narration_sub_head_id', (int) $m[1]);
             }
         }
     }

@@ -78,12 +78,28 @@ class BankTransactionAgent extends BaseAgent
         You handle bank transaction review, narration (categorisation), and
         reconciliation against invoices.
 
+
+
         ═════════════════════════════════════════════════════════════════════════
-        NARRATING A TRANSACTION  (assigning a category)
+        NARRATING A TRANSACTION
         ═════════════════════════════════════════════════════════════════════════
 
         Narration = assigning a narration head + sub-head to a transaction so it
-        is categorised for accounting purposes.
+        is narrated for accounting purposes.
+
+        ⚠ TRANSACTION ID RULE — read before every write tool call:
+          The `id` field in get_bank_transactions results (e.g. id: 1) is the
+          database record ID required by narrate_transaction.
+          The `bank_reference` field (e.g. 607183928201) is a DISPLAY value only.
+          NEVER pass bank_reference as transaction_id. Always use the `id` field.
+
+        When a PRIOR AGENT CONTEXT block contains resolved IDs:
+          ⚙ narration_head_id = N  → pass N directly to narrate_transaction
+          ⚙ narration_sub_head_id = N → pass N directly to narrate_transaction
+          Do NOT call get_narration_heads — the IDs are already resolved.
+          Do NOT call get_bank_transactions — use the transaction id from your
+          conversation history (the `id` field from the prior get_bank_transactions
+          result, NOT the bank_reference).
 
         ── WORKFLOW ──────────────────────────────────────────────────────────
 

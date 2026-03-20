@@ -379,6 +379,7 @@ class ChatOrchestrator
                         $completionMarker = match ($setupIntent) {
                             'client'    => '[CLIENT_ID:',
                             'inventory' => '[INVENTORY_ITEM_ID:',
+                            'narration' => '[NARRATION_HEAD_ID:',
                             default     => '✅',
                         };
 
@@ -408,6 +409,45 @@ class ChatOrchestrator
                         ]);
                         $this->loadActiveInvoiceNumber($conversationId);
                         return ['invoice'];
+                    }
+                }
+
+                $primaryIntents   = ['bank_transaction', 'invoice'];
+                $secondaryIntents = array_diff($intents, $primaryIntents);
+
+                if (!empty($secondaryIntents)) {
+                    $remainingSetup = [];
+
+                    foreach ($secondaryIntents as $setupIntent) {
+                        $completionMarker = match ($setupIntent) {
+                            'client'    => '[CLIENT_ID:',
+                            'inventory' => '[INVENTORY_ITEM_ID:',
+                            'narration' => '[NARRATION_HEAD_ID:',
+                            default     => '✅',
+                        };
+
+                        $isDone = DB::table('agent_conversation_messages')
+                            ->where('conversation_id', $conversationId . ':' . $setupIntent)
+                            ->where('role', 'assistant')
+                            ->where('content', 'LIKE', '%' . $completionMarker . '%')
+                            ->exists(); // ← no created_at filter here
+
+                        if (!$isDone) {
+                            $remainingSetup[] = $setupIntent;
+                        }
+                    }
+
+                    if (empty($remainingSetup)) {
+                        $survivors = array_values(array_intersect($intents, $primaryIntents));
+
+                        if (!empty($survivors)) {
+                            Log::info('[ChatOrchestrator] Setup intents complete — primary only', [
+                                'conversation_id' => $conversationId,
+                                'dropped'         => array_values($secondaryIntents),
+                                'remaining'       => $survivors,
+                            ]);
+                            return $survivors;
+                        }
                     }
                 }
 

@@ -50,6 +50,7 @@ class RouterAgent implements Agent, HasTools
         $intents          = implode(' | ', self::getIntents());
         $domainDefs       = $this->buildDomainDefinitions();
         $suppressionRules = $this->buildSuppressionRules();
+        $coRoutingRules    = $this->buildCoRoutingRules();
 
         return <<<PROMPT
 
@@ -84,6 +85,8 @@ class RouterAgent implements Agent, HasTools
         5. Never include the same intent twice.
 
         {$suppressionRules}
+
+        {$coRoutingRules}
 
         ─────────────────────────────────────────────────────────────────────────
         OUTPUT FORMAT (strict)
@@ -195,5 +198,31 @@ class RouterAgent implements Agent, HasTools
         }
 
         return implode("\n\n", $rules);
+    }
+
+    private function buildCoRoutingRules(): string
+    {
+        return <<<RULES
+
+        7. "narration" + "bank_transaction" CO-ROUTING (critical):
+           When the user asks to CREATE a narration head AND the conversation
+           context involves a bank transaction (words like: assign it, use it,
+           categorize, this transaction, this payment, this credit, this debit,
+           narrate it, as the head), return BOTH intents.
+
+           ✗ WRONG: "create head ABC and assign it as head" (mid-transaction flow)
+                     → ["narration"]
+           ✓ RIGHT:  "create head ABC and assign it as head" (mid-transaction flow)
+                     → ["narration", "bank_transaction"]
+
+           Trigger signals — include "bank_transaction" alongside "narration" when:
+             • Pronouns like "it", "this", "that" follow a creation request
+               (they refer back to the active transaction)
+             • Phrases: "assign it", "use it", "as the head", "for this",
+               "then categorize", "then narrate"
+
+           NOTE: "add a narration head called X" with NO transaction context
+                 → ["narration"] only. The pronoun/assignment phrase is the key signal.
+        RULES;
     }
 }
