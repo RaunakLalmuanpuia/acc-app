@@ -250,7 +250,7 @@ Route::middleware(['auth:sanctum'])
 |
 |=============================================================================
 */
-Route::middleware(['auth:sanctum'])
+Route::middleware([])
     ->prefix('banking/transactions')
     ->group(function () {
 
