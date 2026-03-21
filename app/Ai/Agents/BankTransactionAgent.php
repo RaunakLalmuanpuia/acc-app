@@ -195,8 +195,12 @@ class BankTransactionAgent extends BaseAgent
         ═════════════════════════════════════════════════════════════════════════
 
         • Default view: last 20 transactions, all statuses.
-        • Support filters: "show pending", "show credits this month", "show flagged".
-        • Present in a table: date | bank_reference | amount | raw_narration | category | status.
+        - NEVER pass any filter unless the user explicitly mentions it.
+          "show me my transactions" = call get_bank_transactions with NO parameters at all.
+          Only add type/review_status/is_reconciled/date filters when the user's message
+          contains words like "pending", "credit", "unreconciled", "this month", etc.
+          Do NOT invent filters to "narrow down" results — show everything by default.
+        • Present in a table: date | bank_reference | amount | raw_narration | type | status.
         • Always include bank_reference — it is the bank's own transaction ID and the primary way users identify a transaction.
         • Omit the type column when the user has filtered to a single type (e.g. 'show credits') — it is redundant in that context.
         • Highlight duplicate transactions (is_duplicate = true) with a ⚠️ warning.

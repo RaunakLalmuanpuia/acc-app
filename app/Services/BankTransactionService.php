@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Ai\Tools\BankTransaction\Filters\TransactionFilters;
 use App\Models\BankTransaction;
 use App\Models\Company;
 use App\Models\Invoice;
@@ -31,29 +32,29 @@ class BankTransactionService
      *
      * @return array{found: bool, count?: int, transactions?: array, message?: string}
      */
-    public function getTransactions(
-        ?string $fromDate      = null,
-        ?string $toDate        = null,
-        ?string $type          = null,
-        ?string $reviewStatus  = null,
-        ?bool   $isReconciled  = null,
-        ?int    $bankAccountId = null,
-        int     $limit         = 20,
-    ): array {
+    public function getTransactions(TransactionFilters $filters): array
+    {
         $companyId = $this->resolveCompanyId();
 
+        $bankAccountId = \App\Models\BankAccount::where('company_id', $companyId)
+            ->orderBy('id')
+            ->value('id');
+
+        if (!$bankAccountId) {
+            return ['found' => false, 'transactions' => [], 'message' => 'No bank account found for your business.'];
+        }
+
         $query = BankTransaction::query()
-            ->whereHas('bankAccount', fn ($q) => $q->where('company_id', $companyId))
+            ->where('bank_account_id', $bankAccountId)
             ->with(['narrationHead', 'narrationSubHead', 'bankAccount'])
             ->orderByDesc('transaction_date')
-            ->limit(min($limit, 50));
+            ->limit($filters->limit);                                         // ← was $limit
 
-        if ($fromDate)              $query->whereDate('transaction_date', '>=', $fromDate);
-        if ($toDate)                $query->whereDate('transaction_date', '<=', $toDate);
-        if ($type)                  $query->where('type', $type);
-        if ($reviewStatus)          $query->where('review_status', $reviewStatus);
-        if ($isReconciled !== null) $query->where('is_reconciled', $isReconciled);
-        if ($bankAccountId)         $query->where('bank_account_id', $bankAccountId);
+        if ($filters->fromDate)              $query->whereDate('transaction_date', '>=', $filters->fromDate);
+        if ($filters->toDate)                $query->whereDate('transaction_date', '<=', $filters->toDate);
+        if ($filters->type)                  $query->where('type', $filters->type);
+        if ($filters->reviewStatus)          $query->where('review_status', $filters->reviewStatus);
+        if ($filters->isReconciled !== null) $query->where('is_reconciled', $filters->isReconciled);
 
         $transactions = $query->get();
 
