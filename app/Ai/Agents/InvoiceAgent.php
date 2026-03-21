@@ -5,7 +5,8 @@ namespace App\Ai\Agents;
 use App\Ai\AgentCapability;
 use App\Ai\Tools\Invoice\AddLineItemTool;
 use App\Ai\Tools\Invoice\CreateInvoiceTool;
-use App\Ai\Tools\Invoice\FinalizeInvoiceTool;
+use App\Ai\Tools\Invoice\ReopenInvoiceTool;
+use App\Ai\Tools\Invoice\RemoveLineItemTool;
 use App\Ai\Tools\Invoice\GenerateInvoicePdfTool;
 use App\Ai\Tools\Invoice\GetActiveDraftsTool;
 use App\Ai\Tools\Invoice\GetInvoiceTool;
@@ -41,7 +42,8 @@ class InvoiceAgent extends BaseAgent
             'create_invoice',
             'add_line_item',
             'generate_invoice_pdf',
-            'finalize_invoice',
+            'reopen_invoice',
+            'remove_line_item',
         ];
     }
 
@@ -179,20 +181,40 @@ class InvoiceAgent extends BaseAgent
           • Call add_line_item. Show running total after each addition.
           • Ask: "Would you like to add another item?"
 
+
+        STEP 4b — REMOVING A LINE ITEM
+          • When the user asks to remove or delete a line item:
+            1. Call get_invoice to retrieve current line item IDs.
+            2. Identify the correct line_item_id from the results.
+            3. Call remove_line_item with invoice_id and line_item_id.
+          • NEVER add a zero-quantity or zero-amount line item to simulate
+            removal — this is wrong and corrupts the invoice totals.
+          • After removal, show the updated line items table and new total.
+
         STEP 5 — REVIEW
           • Call get_invoice and present: line items table, subtotal,
             GST breakdown (CGST+SGST or IGST), total.
           • Ask: "Does everything look correct?"
 
-        STEP 6 — GENERATE PDF
+        STEP 6 — GENERATE PDF & SEND
           • Only after user confirms Step 5.
-          • Call generate_invoice_pdf. Present the download_url as:
-            "📄 Your invoice PDF is ready — [Download INV-XXXXXXXX]({download_url})"
-          • Always render as a clickable markdown link.
+          • Call generate_invoice_pdf. This generates the PDF AND marks the invoice
+            as sent in one operation.
+          • Present the download URL as:
+            "📄 Invoice sent — [Download INV-XXXXXXXX]({download_url})"
 
-        STEP 7 — FINALIZE
-          • Ask: "Mark this invoice as sent?"
-          • On confirmation, call finalize_invoice with status="sent".
+
+        ═══════════════════════════════════
+        EDITING A SENT INVOICE
+        ═══════════════════════════════════
+
+        When a user wants to edit an invoice that is already sent:
+          • Call reopen_invoice first — this sets it back to draft.
+          • Confirm with the user: "INV-XXXXXXXX has been reopened for editing."
+          • Proceed with edits (add/remove line items, etc.) as normal.
+          • When done, call generate_invoice_pdf — this saves the new PDF
+            (same invoice number, overwrites the old file) and marks it as sent again.
+          • Do NOT call finalize_invoice — it no longer exists.
 
 
         ═════════════════════════════════════════════════════════════════════════
@@ -226,13 +248,29 @@ class InvoiceAgent extends BaseAgent
           • client_id    — from lookup_client, never invent.
           • invoice_id   — from create_invoice or get_active_drafts, never invent.
           • inventory_item_id — from lookup_inventory_item, or omit for manual lines.
+          • line_item_id — from get_invoice results only, never invent.
 
         NEVER guess or fabricate numeric IDs.
 
-        Always pass invoice_number to generate_invoice_pdf and finalize_invoice.
-        Never pass invoice_id to these two tools.
+        CRITICAL — DO NOT REUSE IDs ACROSS DIFFERENT ITEMS:
+          • Each inventory_item_id belongs to exactly one product.
+          • If lookup_inventory_item returns no results for an item, do NOT
+            reuse an inventory_item_id from a different item seen earlier in
+            this conversation.
+          • Instead: call add_line_item with NO inventory_item_id and set
+            description manually. The item will be added as a manual line.
+          • Example of what is FORBIDDEN:
+            User asks for "chairs" → lookup returns item_id=15 (Chairs)
+            User then asks for "tables" → lookup returns nothing
+            ✗ WRONG: call add_line_item with inventory_item_id=15 (Chairs' ID)
+            ✓ RIGHT: call add_line_item with no inventory_item_id,
+                     description="Tables", rate and quantity from user
 
-        For create_invoice and add_line_item, use invoice_id from tool responses.
+        Always pass invoice_number to generate_invoice_pdf.
+        Never pass invoice_id to generate_invoice_pdf.
+
+        For create_invoice, add_line_item, and remove_line_item,
+        use invoice_id from tool responses.
 
 
         ═════════════════════════════════════════════════════════════════════════
@@ -254,6 +292,18 @@ class InvoiceAgent extends BaseAgent
         • Never expose raw database IDs. Refer to invoices by invoice_number.
         • Use "client" not "customer" in all user-facing replies.
 
+        RATE RULE — applies to every add_line_item call, in both create AND edit flows:
+          When adding a line item where lookup_inventory_item returns no results
+          AND the user did not provide a rate in their message:
+          → Stop. Ask: "What's the rate per unit for [item name]?"
+          → Do NOT borrow the rate from another line item already on the invoice.
+          → Do NOT guess or default to any value.
+          → Only call add_line_item after the user provides the rate explicitly.
+
+          When the user DID provide a rate (e.g. "add 20 tables at ₹500 each"):
+          → Call add_line_item immediately with no inventory_item_id.
+          → Do not ask for confirmation again.
+
         PROMPT;
     }
 
@@ -270,7 +320,10 @@ class InvoiceAgent extends BaseAgent
             new AddLineItemTool($companyId),
             new GetInvoiceTool($companyId),
             new GenerateInvoicePdfTool($companyId),
-            new FinalizeInvoiceTool($companyId),
+            new ReopenInvoiceTool($companyId),
+            new RemoveLineItemTool($companyId),
+//            new FinalizeInvoiceTool($companyId),
+
         ];
     }
 }

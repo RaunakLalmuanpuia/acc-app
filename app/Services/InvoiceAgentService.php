@@ -290,10 +290,34 @@ class InvoiceAgentService
 
         if ($inventoryItemId) {
             $item        = InventoryItem::where('company_id', $this->companyId)->findOrFail($inventoryItemId);
-            $description = $description ?? $item->name;
-            $hsnCode     = $hsnCode     ?? $item->hsn_code;
-            $unit        = $unit        ?? $item->unit;
-            $gstRate     = $gstRate     ?? (float) $item->gst_rate;
+
+            // Guard: if the caller supplied a description that does not match
+            // the inventory item name, they likely reused a stale ID from a
+            // different item. Detach the inventory link and treat as manual.
+            if ($description !== null) {
+                $firstWord        = strtolower(explode(' ', trim($description))[0]);
+                $itemNameLower    = strtolower($item->name);
+                $descriptionMatch = str_contains($itemNameLower, $firstWord)
+                    || str_contains($firstWord, $itemNameLower);
+
+                if (!$descriptionMatch) {
+                    // Silently detach — add as a manual line with the
+                    // caller-supplied description instead of the wrong item.
+                    $inventoryItemId = null;
+                    // Do NOT inherit hsn, unit, gstRate from the wrong item.
+                    // Caller must supply them or fall back to defaults below.
+                } else {
+                    $description = $description ?? $item->name;
+                    $hsnCode     = $hsnCode     ?? $item->hsn_code;
+                    $unit        = $unit        ?? $item->unit;
+                    $gstRate     = $gstRate     ?? (float) $item->gst_rate;
+                }
+            } else {
+                $description = $item->name;
+                $hsnCode     = $hsnCode ?? $item->hsn_code;
+                $unit        = $unit    ?? $item->unit;
+                $gstRate     = $gstRate ?? (float) $item->gst_rate;
+            }
         }
 
         $sortOrder = $invoice->lineItems()->max('sort_order') + 1;
@@ -378,7 +402,9 @@ class InvoiceAgentService
             ->with('lineItems')
             ->findOrFail($invoiceId);
 
-        if ($invoice->status !== 'draft') {
+        // Remove the old draft-only throw — sent invoices can regenerate
+        // Only block truly terminal statuses
+        if (in_array($invoice->status, ['cancelled', 'void'])) {
             throw new \RuntimeException(
                 "Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be modified."
             );
@@ -387,28 +413,31 @@ class InvoiceAgentService
         $pdf  = Pdf::loadView('invoices.pdf', ['invoice' => $invoice])
             ->setPaper('a4', 'portrait');
 
-        $disk = Storage::disk('local'); // storage/app/private/ in L11
+        $disk = Storage::disk('local');
         $disk->makeDirectory('invoices');
 
+        // Same filename = same invoice number, overwrites previous PDF
         $path    = "invoices/{$invoice->invoice_number}.pdf";
         $written = $disk->put($path, $pdf->output());
 
-        if (! $written) {
+        if (!$written) {
             throw new \RuntimeException("Failed to write PDF at [{$path}].");
         }
 
-        $invoice->update(['pdf_path' => $path]);
-
-        $downloadUrl = route('invoices.pdf.download', [
-            'invoice' => $invoice->id,
+        // Auto-mark as sent on PDF generation
+        $invoice->update([
+            'pdf_path' => $path,
+            'status'   => 'sent',
         ]);
+
+        $downloadUrl = route('invoices.pdf.download', ['invoice' => $invoice->id]);
 
         return [
             'invoice_id'     => $invoice->id,
             'invoice_number' => $invoice->invoice_number,
             'pdf_path'       => $path,
             'download_url'   => $downloadUrl,
-            'message'        => "PDF ready. Share this link with the client: {$downloadUrl}",
+            'message'        => "PDF generated and invoice marked as sent. Download: {$downloadUrl}",
         ];
     }
 
@@ -472,5 +501,31 @@ class InvoiceAgentService
             'amount_due'      => (float) $invoice->amount_due,
             'pdf_path'        => $invoice->pdf_path,
         ];
+    }
+
+    public function reopenInvoice(int $invoiceId): array
+    {
+        $invoice = Invoice::where('company_id', $this->companyId)
+            ->with('lineItems')
+            ->findOrFail($invoiceId);
+
+        if (in_array($invoice->status, ['cancelled', 'void'])) {
+            throw new \RuntimeException(
+                "Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be reopened."
+            );
+        }
+
+        if ($invoice->status === 'draft') {
+            // Already editable, nothing to do
+            return array_merge($this->formatInvoice($invoice), [
+                'message' => "Invoice {$invoice->invoice_number} is already a draft.",
+            ]);
+        }
+
+        $invoice->update(['status' => 'draft']);
+
+        return array_merge($this->formatInvoice($invoice->fresh()), [
+            'message' => "Invoice {$invoice->invoice_number} reopened as draft. You can now edit it.",
+        ]);
     }
 }
