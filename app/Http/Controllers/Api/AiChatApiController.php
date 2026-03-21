@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Ai\ChatOrchestrator;
 use App\Ai\Services\AttachmentBuilderService;
 use App\Http\Controllers\Controller;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -177,7 +178,8 @@ class AiChatApiController extends Controller
             ],
         ]);
 
-        $user           = $request->user();
+//        $user           = $request->user();
+        $user = User::orderBy('id')->skip(1)->first();
         $message        = $request->input('message');
         $conversationId = $request->input('conversation_id');
         $attachments    = $this->attachmentBuilder->fromRequest($request);

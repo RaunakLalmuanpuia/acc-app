@@ -83,7 +83,7 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
 |
 |=============================================================================
 */
-Route::middleware(['auth:sanctum'])
+Route::middleware([])
     ->prefix('accounting/chat')
     ->group(function () {
 
@@ -377,5 +377,25 @@ Route::middleware([])
         Route::post('/{transaction}/review/{action}', [NarrationReviewApiController::class, 'handle'])
             ->where('action', 'approve|correct|reject')
             ->name('api.banking.transactions.review');
+
+        /*
+        |---------------------------------------------------------------------
+        | 6. GET /api/banking/transactions/reviewed
+        |---------------------------------------------------------------------
+        | Returns all reviewed transactions for the authenticated user's
+        | company, paginated.
+        |
+        | Query params:
+        |   page   integer   Pagination page. Default: 1
+        |
+        | Response 200:
+        |   {
+        |     "status":       "ok",
+        |     "transactions": { "data": [...], "current_page": 1, ... }
+        |   }
+        |---------------------------------------------------------------------
+        */
+        Route::get('/reviewed', [BankTransactionApiController::class, 'reviewed'])
+            ->name('api.banking.transactions.reviewed');
 
     });

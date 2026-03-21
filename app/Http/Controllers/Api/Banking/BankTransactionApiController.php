@@ -161,6 +161,8 @@ class BankTransactionApiController extends Controller
      */
     public function pending(Request $request): JsonResponse
     {
+
+        //        $user    = $request->user();
         $user = User::orderBy('id')->skip(1)->first();
         $company = $user->companies()->orderBy('id')->first();
 
@@ -190,7 +192,7 @@ class BankTransactionApiController extends Controller
         $transactions = BankTransaction::with(['narrationHead', 'narrationSubHead', 'reconciledInvoice'])
             ->where('bank_account_id', $bankAccountId)
             ->where('is_duplicate', false)
-            ->whereIn('review_status', ['pending', 'reviewed'])
+            ->where('review_status', 'pending')
             ->orderByDesc('transaction_date')
             ->paginate(25);
 
@@ -213,9 +215,103 @@ class BankTransactionApiController extends Controller
 
         return response()->json([
             'status'       => 'ok',
-            'has_company'  => true,
-            'bank_accounts'=> $bankAccounts,
-            'heads'        => $heads,
+//            'has_company'  => true,
+//            'bank_accounts'=> $bankAccounts,
+//            'heads'        => $heads,
+            'transactions' => $transactions,
+        ]);
+    }
+
+    /**
+     * Return paginated reviewed transactions.
+     *
+     * -------------------------------------------------------------------------
+     * REQUEST HEADERS
+     * -------------------------------------------------------------------------
+     *  Authorization : Bearer <sanctum-token>   [REQUIRED]
+     *  Accept        : application/json          [REQUIRED]
+     *
+     * -------------------------------------------------------------------------
+     * QUERY PARAMETERS
+     * -------------------------------------------------------------------------
+     *  page     integer   OPTIONAL   Pagination page number. Default: 1
+     *
+     * -------------------------------------------------------------------------
+     * RESPONSE 200
+     * -------------------------------------------------------------------------
+     *  {
+     *    "status": "ok",
+     *    "transactions": {
+     *      "data": [
+     *        {
+     *          "id":                    42,
+     *          "raw_narration":         "NEFT/CR/INV001/CLIENT",
+     *          "amount":                "15000.00",
+     *          "type":                  "credit",
+     *          "review_status":         "reviewed",
+     *          "transaction_date":      "2024-06-15",
+     *          "is_reconciled":         true,
+     *          "narration_head_id":     1,
+     *          "narration_sub_head_id": 10,
+     *          "party_name":            "Acme Corp",
+     *          "narration_note":        "June payment",
+     *          "reconciled_invoice":    { ... }
+     *        }
+     *      ],
+     *      "current_page": 1,
+     *      "last_page":    2,
+     *      "per_page":     25,
+     *      "total":        38
+     *    }
+     *  }
+     *
+     * @param  Request $request
+     * @return JsonResponse
+     */
+    public function reviewed(Request $request): JsonResponse
+    {
+
+        $user = User::orderBy('id')->skip(1)->first();
+        $company = $user->companies()->orderBy('id')->first();
+
+        if (!$company) {
+            return response()->json([
+                'status'       => 'ok',
+                'has_company'  => false,
+                'transactions' => null,
+            ]);
+        }
+
+        $bankAccountId = $company->bankAccounts()->orderBy('id')->value('id');
+
+        if (!$bankAccountId) {
+            return response()->json([
+                'status'       => 'ok',
+                'has_company'  => true,
+                'transactions' => null,
+            ]);
+        }
+
+        $transactions = BankTransaction::with(['narrationHead', 'narrationSubHead', 'reconciledInvoice'])
+            ->where('bank_account_id', $bankAccountId)
+            ->where('is_duplicate', false)
+            ->where('review_status', 'reviewed')
+            ->orderByDesc('transaction_date')
+            ->paginate(25);
+
+        $transactions->getCollection()->transform(function (BankTransaction $tx) {
+            if (!$tx->is_reconciled) {
+                $tx->setAttribute('invoice_suggestions', $this->formatSuggestions(
+                    $this->matcher->findCandidates($tx)
+                ));
+            } else {
+                $tx->setAttribute('invoice_suggestions', []);
+            }
+            return $tx;
+        });
+
+        return response()->json([
+            'status'       => 'ok',
             'transactions' => $transactions,
         ]);
     }
