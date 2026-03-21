@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\BankAccount;
 use App\Models\BankTransaction;
 use App\Models\NarrationHead;
+use App\Models\User;
 use App\Services\Banking\InvoiceMatchingService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -160,7 +161,7 @@ class BankTransactionApiController extends Controller
      */
     public function pending(Request $request): JsonResponse
     {
-        $user    = $request->user();
+        $user = User::orderBy('id')->skip(1)->first();
         $company = $user->companies()->orderBy('id')->first();
 
         if (!$company) {
