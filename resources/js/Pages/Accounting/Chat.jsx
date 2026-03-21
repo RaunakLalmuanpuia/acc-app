@@ -400,9 +400,9 @@ export default function Chat() {
     const inputBlocked = processing || confirming || hitlState.active;
 
     const suggestedPrompts = [
-        'Fetch me an invoice',
-        'Issue an invoice',
-        'Give me 6 month report',
+        // 'Fetch me an invoice',
+        // 'Issue an invoice',
+        // 'Give me 6 month report',
     ];
 
     const botFeatures = [
