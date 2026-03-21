@@ -18,7 +18,7 @@ return new class extends Migration
             // Raw bank data
             $table->date('transaction_date');
             $table->string('bank_reference')->nullable();
-            $table->text('raw_narration');
+            $table->longText('raw_narration');
             $table->enum('type', ['credit', 'debit']);
             $table->decimal('amount', 15, 2);
             $table->decimal('balance_after', 15, 2)->nullable();
