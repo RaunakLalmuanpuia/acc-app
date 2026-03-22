@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Banking\EmailIngestRequest;
 use App\Models\BankAccount;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Log;
 
 /**
  * ============================================================================
@@ -112,6 +113,7 @@ class EmailIngestApiController extends Controller
      */
     public function __invoke(EmailIngestRequest $request): JsonResponse
     {
+        Log::info('Email received', $request->all());
         $account = BankAccount::findOrFail($request->bank_account_id);
 
         // buildRawEmail() merges subject + body, same as the web controller
