@@ -436,6 +436,9 @@ class ChatOrchestrator
                                 'dropped'         => array_values($secondaryIntents),
                                 'remaining'       => $survivors,
                             ]);
+                            if (in_array('invoice', $survivors)) {
+                                $this->loadActiveInvoiceNumber($conversationId);
+                            }
                             return $survivors;
                         }
                     }
@@ -468,6 +471,7 @@ class ChatOrchestrator
 
     private function loadActiveInvoiceNumber(string $conversationId): void
     {
+        // Primary: meta column (fast, exact)
         $metaJson = DB::table('agent_conversation_messages')
             ->where('conversation_id', $conversationId . ':invoice')
             ->where('role', 'assistant')
@@ -480,11 +484,39 @@ class ChatOrchestrator
             $this->activeInvoiceNumber = $decoded['invoice_number'] ?? null;
 
             if ($this->activeInvoiceNumber) {
-                Log::info('[ChatOrchestrator] Active invoice number loaded', [
+                Log::info('[ChatOrchestrator] Active invoice number loaded from meta', [
                     'conversation_id' => $conversationId,
                     'invoice_number'  => $this->activeInvoiceNumber,
                 ]);
+                return;
             }
+        }
+
+        // Fallback: scan the most recent assistant message content
+        // Scoped to the last multi-intent turn so we don't pick up older invoices
+        $lastMultiAt = DB::table('agent_conversation_messages')
+            ->where('conversation_id', 'like', $conversationId . ':%')
+            ->where('role', 'assistant')
+            ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true")
+            ->orderByDesc('created_at')
+            ->value('created_at');
+
+        if ($lastMultiAt === null) return;
+
+        $content = DB::table('agent_conversation_messages')
+            ->where('conversation_id', $conversationId . ':invoice')
+            ->where('role', 'assistant')
+            ->where('created_at', '>=', $lastMultiAt)
+            ->orderByDesc('created_at')
+            ->value('content');
+
+        if ($content && preg_match('/INV-\d{8}-\d+/', $content, $matches)) {
+            $this->activeInvoiceNumber = $matches[0];
+
+            Log::info('[ChatOrchestrator] Active invoice number loaded from content fallback', [
+                'conversation_id' => $conversationId,
+                'invoice_number'  => $this->activeInvoiceNumber,
+            ]);
         }
     }
 }

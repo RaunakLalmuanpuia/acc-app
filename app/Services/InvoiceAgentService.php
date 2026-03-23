@@ -135,6 +135,8 @@ class InvoiceAgentService
         $dueDateFrom = $normalise($dueDateFrom);
         $dueDateTo   = $normalise($dueDateTo);
 
+        \DB::enableQueryLog();
+
         $invoices = Invoice::query()
             ->where('company_id', $this->companyId)
             ->when($status,      fn($q) => $q->where('status', $status))
@@ -172,6 +174,8 @@ class InvoiceAgentService
             ->orderByDesc('invoice_date')
             ->limit($limit)
             ->get();
+
+        \Log::info('[searchInvoices] query log', \DB::getQueryLog());
 
         $invoices->load('lineItems');
 

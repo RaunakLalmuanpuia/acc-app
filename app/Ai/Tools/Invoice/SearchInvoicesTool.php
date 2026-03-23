@@ -58,22 +58,11 @@ class SearchInvoicesTool implements Tool
 
     public function handle(Request $request): string
     {
-        \Log::info('[SearchInvoicesTool] raw request', [
-            'status' => $request['status'] ?? 'NOT SET',
-            'query'  => $request['query']  ?? 'NOT SET',
-        ]);
-
         try {
             $service = new InvoiceAgentService($this->companyId);
 
             $query  = strlen($request['query'] ?? '') > 0 ? trim($request['query']) : null;
-            $status = $request['status'] ?? null;
-
-            // Hard guard: if no query and status defaulted to draft,
-            // the agent ignored instructions — clear it to return all invoices.
-            if ($query === null && $status === 'draft') {
-                $status = null;
-            }
+            $status = strlen($request['status'] ?? '') > 0 ? trim($request['status']) : null;
 
             $amountMin = isset($request['amount_min']) && (float) $request['amount_min'] > 0
                 ? (float) $request['amount_min']
@@ -83,13 +72,37 @@ class SearchInvoicesTool implements Tool
                 ? (float) $request['amount_max']
                 : null;
 
+            $hasDateFilter = ($request['date_from']     ?? '') !== ''
+                || ($request['date_to']       ?? '') !== ''
+                || ($request['due_date_from'] ?? '') !== ''
+                || ($request['due_date_to']   ?? '') !== '';
+
+            $isGeneralListRequest = $query === null
+                && !$hasDateFilter
+                && $amountMin === null
+                && $amountMax === null;
+
+            if ($isGeneralListRequest && $status !== null) {
+                $status = null;
+            }
+
+            \Log::info('[SearchInvoicesTool] resolved params', [
+                'raw_status'       => $request['status']     ?? 'NOT SET',
+                'raw_date_from'    => $request['date_from']  ?? 'NOT SET',
+                'raw_date_to'      => $request['date_to']    ?? 'NOT SET',
+                'effective_status' => $status                ?? 'NULL',
+                'effective_query'  => $query                 ?? 'NULL',
+                'is_general_list'  => $isGeneralListRequest,
+                'companyId'        => $this->companyId,
+            ]);
+
             $invoices = $service->searchInvoices(
                 query:       $query,
                 status:      $status,
-                dateFrom:    $request['date_from']     ?? null,
-                dateTo:      $request['date_to']       ?? null,
-                dueDateFrom: $request['due_date_from'] ?? null,
-                dueDateTo:   $request['due_date_to']   ?? null,
+                dateFrom:    ($request['date_from']     ?? '') !== '' ? $request['date_from']     : null,
+                dateTo:      ($request['date_to']       ?? '') !== '' ? $request['date_to']       : null,
+                dueDateFrom: ($request['due_date_from'] ?? '') !== '' ? $request['due_date_from'] : null,
+                dueDateTo:   ($request['due_date_to']   ?? '') !== '' ? $request['due_date_to']   : null,
                 amountMin:   $amountMin,
                 amountMax:   $amountMax,
                 limit:       isset($request['limit']) ? min((int) $request['limit'], 50) : 15,
@@ -109,6 +122,10 @@ class SearchInvoicesTool implements Tool
             ]);
 
         } catch (\Throwable $e) {
+            \Log::error('[SearchInvoicesTool] exception', [
+                'message' => $e->getMessage(),
+                'trace'   => $e->getTraceAsString(),
+            ]);
             return json_encode(['error' => $e->getMessage()]);
         }
     }

@@ -146,12 +146,19 @@ class InvoiceAgent extends BaseAgent
           • Do NOT enter the create workflow unless explicitly asked.
 
         Examples:
-          "show me all my invoices"    → search_invoices() — no arguments
+          "show me my invoices"        → search_invoices() — no arguments, no status
+          "show all my invoices"       → search_invoices() — no arguments, no status
+          "list my invoices"           → search_invoices() — no arguments, no status
+          "show me all invoices"       → search_invoices() — no arguments, no status
           "list invoices"              → search_invoices() — no arguments
           "show invoices for Infosys"  → search_invoices(query: "Infosys")
           "show all draft invoices"    → search_invoices(status: "draft")
           "show unpaid invoices"       → search_invoices(status: "sent")
           "invoices from this month"   → search_invoices(date_from: "{$today}")
+
+        NEVER pass status when the user's message does not contain a status word
+        (draft/sent/paid/cancelled/void/unpaid). "Show me my invoices" contains
+        no status word — passing status="sent" here is a critical error.
 
 
         ═════════════════════════════════════════════════════════════════════════
